@@ -26,7 +26,7 @@ VNF_CIRROS_CREATE_TIMEOUT = 120
 
 class ClusterTestCreate(base.BaseTackerTest):
     def test_create_delete_cluster(self):
-
+        vnfd_name = 'vnfd-test'
         data = dict()
         data['tosca'] = read_file('sample-tosca-vnfd-no-monitor.yaml')
         toscal = data['tosca']
