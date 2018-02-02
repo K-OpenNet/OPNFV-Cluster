@@ -49,7 +49,7 @@ Proposed change
 The proposed component in NFVO to support high availability cluster management
 is shown as below figure:
 
-![Architecture of HA deployment in Tacker](../master/arch_ha_deployment.png)
+![Architecture of HA deployment in Tacker](../master/arch_ha_deployment.PNG)
 
 The high level changes needed to Tacker aim at accommodating a new feature in
 VNF cluster management will include changes to Tacker Client and Tacker
