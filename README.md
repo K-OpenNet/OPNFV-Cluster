@@ -235,3 +235,104 @@ action can be seen in the following block:
               vendor: Tacker
 
 Example of cluster creation CLI:
+  .. code-block:: console
+
+   tacker cluster-create --vnfd-name vnfd-sample --policy-file policy.yaml
+   --name cluster-sample
+
+At cluster creation time, the NFVO plugin will query VNFM to find
+available VNFD resouces that exist from provided VNFD ID. It also read
+policy file in order to deploy cluster by following the defined configuration.
+
+New 'nfvo' extension will be introduced in Tacker API v1 that implements REST
+API end point for clusters and clustermembers resources as described below:
+
+.. csv-table:: **/clusters**
+    :header: Attribute Name,Type,Access,Default, Validation Conversion,Des
+
+    id, string (UUID),"RO, All",generated,N/A,identity
+    tenant_id, String (UUID), "RW, All", "None, (Required)", uuid, "tenant ID
+    to launch vnf-cluster"
+    name, string,"RW, All","None, (Required)",string,human-readable name
+    description, string, "RW, All", None, string, description of cluster
+    status, string, "RO, All", generated, string, Status of created cluster
+    vnfd_id, string (UUID), "RO, All", None (Required), uuid, "VNFD ID to use
+    to deploy cluster members"
+    lb_info, string, "RO, All", "None, (Required)", string, "attributes of
+    created load balancer"
+    role_config, string, "RO, All", "None, (Required)", string, "role
+    configuration of cluster members"
+
+.. csv-table:: **/clustermembers**
+    :header: Attribute Name,Type,Access,Default, Validation Conversion,Des
+
+    id,string (UUID),"RO, All",generated,N/A,identity
+    tenant_id, String (UUID), "RW, All", "None, (Required)", uuid, "tenant ID
+    to launch cluster member"
+    name, string,"RW, All","None, (Required)",string,human-readable name
+    cluster_id, string (UUID), "RO, All", generated, uuid, "ID of associated
+    cluster"
+    vnf_id, string (UUID), "RO, All", generated, uuid, "ID of associated vnf"
+    mgmt_url, string, "RO, All", generated, string, "Management URL of
+    associated vnf"
+    role, string, "RW, All", generated, String, Role of member in cluster
+    lb_member_id, string (UUID), "RO, All", generated, uuid, "ID of associated
+    Neutron load balancer"
+    placement_attr, string, "RW, All", None (Required), string, "VIM name where
+    cluster members are deployed"
+
+Security impact
+---------------
+
+None
+
+Notifications impact
+--------------------
+
+None
+
+Other end user impact
+---------------------
+
+There will be changes to python-tackerclient for the end user in order to
+manage clusters and cluster-members. The changes will involve adding new shell
+extensions to python-tackerclient in order to allow CRUD operations for cluster
+and cluster-member.
+
+Performance Impact
+------------------
+
+None
+
+Other deployer impact
+---------------------
+
+**neutron-lbaas** and **octavia** should be installed to make this feature work
+so it is necessary to update the tacker's Devstack installation procedure in
+the script and the manual installation guideline. Because **neutron-lbaas**
+resources are queried in order to deploy load balancer during cluster
+creation by using Neutron client.
+
+Developer impact
+----------------
+
+None
+
+Implementation
+==============
+
+Assignee(s)
+-----------
+
+Primary author and contact.
+
+   longkb <longkb@bka.vn>
+
+   xuan0802 <thespring1989@gmail.com>
+
+Primary assignee:
+
+  longkb <longkb@bka.vn>
+
+  xuan0802 <thespring1989@gmail.com>
+
