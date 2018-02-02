@@ -1,5 +1,5 @@
 # OPNFV-Cluster
-=========================================================
+
 Enable policy-based clustering service for VNFs in Tacker
 =========================================================
 
