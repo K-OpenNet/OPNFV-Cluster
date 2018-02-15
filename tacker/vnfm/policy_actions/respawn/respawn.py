@@ -16,7 +16,6 @@ from oslo_log import log as logging
 from oslo_utils import timeutils
 
 from tacker.db.common_services import common_services_db_plugin
-from tacker import manager
 from tacker.plugins.common import constants
 from tacker.vnfm.infra_drivers.openstack import heat_client as hc
 from tacker.vnfm.policy_actions import abstract_action
@@ -94,20 +93,3 @@ class VNFActionRespawn(abstract_action.AbstractPolicyAction):
                 _delete_heat_stack(vim_res['vim_auth'])
                 vnf_dict['attributes'].pop('alarming_policy')
                 _respawn_vnf()
-
-
-class ClusterActionRecovery(abstract_action.AbstractPolicyAction):
-    def get_type(self):
-        return 'recovery'
-
-    def get_name(self):
-        return 'recovery'
-
-    def get_description(self):
-        return 'Tacker VNF cluster Recovery policy'
-
-    def execute_action(self, plugin, context, vnf_dict, args):
-        LOG.error(('Recovery action for cluster member %s dead'),
-                  vnf_dict['id'])
-        nfvo_plugin = manager.TackerManager.get_service_plugins()['NFVO']
-        nfvo_plugin.recovery_action(context, vnf_dict['id'])
