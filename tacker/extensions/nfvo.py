@@ -245,6 +245,14 @@ class ClassifierNotFoundException(exceptions.NotFound):
     message = _('Classifier %(classifier_id)s could not be found')
 
 
+class VnfMappingNotFoundException(exceptions.NotFound):
+    message = _('VNF mapping not found/defined')
+
+
+class VnfMappingNotValidException(exceptions.TackerException):
+    message = _('The %(vnfd)s is not found in constituent VNFDs')
+
+
 class NSDInUse(exceptions.InUse):
     message = _('NSD %(nsd_id)s is still in use')
 
@@ -255,6 +263,27 @@ class NSInUse(exceptions.InUse):
 
 class NoTasksException(exceptions.TackerException):
     message = _('No tasks to run for %(action)s on %(resource)s')
+
+
+class UpdateChainException(exceptions.TackerException):
+    message = _("%(message)s")
+
+
+class UpdateClassifierException(exceptions.TackerException):
+    message = _("%(message)s")
+
+
+class UpdateVnffgException(exceptions.TackerException):
+    message = _("%(message)s")
+
+
+class LBUnsupportedAlgorithmTypeException(exceptions.TackerException):
+    message = _("Algorithm %(type)s is unsupported by Load balancer")
+
+
+class LBUnsupportedProtocolTypeException(exceptions.TackerException):
+    message = _("Protocol %(type)s is unsupported by Load balancer")
+
 
 NAME_MAX_LEN = 255
 
@@ -463,7 +492,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         },
         'vnffgd_template': {
             'allow_post': True,
-            'allow_put': False,
+            'allow_put': True,
             'validate': {'type:dict_or_nodata': None},
             'is_visible': True,
             'default': None,
@@ -620,6 +649,12 @@ RESOURCE_ATTRIBUTE_MAP = {
             'allow_put': False,
             'is_visible': True,
         },
+        'name': {
+            'allow_post': True,
+            'allow_put': True,
+            'validate': {'type:string': NAME_MAX_LEN},
+            'is_visible': True,
+        },
     },
 
     'nsds': {
@@ -701,7 +736,7 @@ RESOURCE_ATTRIBUTE_MAP = {
         'description': {
             'allow_post': True,
             'allow_put': True,
-            'validate': {'type:string': None},
+            'validate': {'type:string': NAME_MAX_LEN},
             'is_visible': True,
             'default': '',
         },
@@ -816,6 +851,12 @@ RESOURCE_ATTRIBUTE_MAP = {
             'allow_put': False,
             'is_visible': True,
         },
+        'vip_endpoint': {
+            'allow_post': False,
+            'allow_put': False,
+            'validate': {'type:dict_or_nodata': None},
+            'is_visible': True,
+        },
         'lb_info': {
             'allow_post': False,
             'allow_put': False,
@@ -864,17 +905,18 @@ RESOURCE_ATTRIBUTE_MAP = {
             'validate': {'type:uuid': None},
             'is_visible': True,
         },
-        'placement_attr': {
-            'allow_post': True,
-            'allow_put': False,
-            'validate': {'type:string': None},
-            'is_visible': True,
-        },
         'role': {
             'allow_post': True,
             'allow_put': True,
             'validate': {'type:string': None},
             'is_visible': True,
+        },
+        'vim_id': {
+            'allow_post': True,
+            'allow_put': False,
+            'validate': {'type:string': None},
+            'is_visible': True,
+            'default': '',
         },
         'lb_member_id': {
             'allow_post': False,

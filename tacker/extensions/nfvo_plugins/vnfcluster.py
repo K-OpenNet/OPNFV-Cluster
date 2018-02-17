@@ -53,14 +53,59 @@ class VnfClusterPluginBase(service_base.NFVPluginBase):
         pass
 
 
-class VnfClusterNotFound(exceptions.NotFound):
-    message = ('VnfCluster %(cluster_id)s could not be found')
+class ClusterCreateFailed(exceptions.TackerException):
+    message = _('Creating cluster based on %(cluster_id)s failed.')
 
 
-class VnfClusterMemberNotFound(exceptions.NotFound):
-    message = ('VnfClusterMember %(cluster_member_id)s could not be found')
+class ClusterNotFound(exceptions.NotFound):
+    message = ('Cluster %(cluster_id)s could not be found.')
 
 
-class VnfClusterMemberRoleNotFound(exceptions.NotFound):
-    message = ('VnfClusterMember with role: '
-               '%(member_role)s could not be found')
+class ClusterRoleConfigInvalid(exceptions.TackerException):
+    message = _('Invalid cluster role configuration.')
+
+
+class LoadBalancerCreateFailed(exceptions.TackerException):
+    message = _('Creating Load balancer failed.')
+
+
+class ClusterInUse(exceptions.InUse):
+    message = _('Cluster %(cluster_id)s is still in use')
+
+
+class LoadBalancerConfigAttributeNotFound(exceptions.NotFound):
+    message = _('%(lb_attr)s is not found in load balancer configuration.')
+
+
+class LoadBalancerResourceNotFound(exceptions.NotFound):
+    message = _('Load balancer resouces are not found in %(vim)s.')
+
+
+class InvalidLoadBalancerConfig(exceptions.InvalidInput):
+    message = _('Invalid %(config)s in policy file.')
+
+
+class ClusterMemberNotFound(exceptions.NotFound):
+    message = ('Cluster member %(clustermember_id)s could not be found.')
+
+
+class ClusterMemberCreateFailed(exceptions.TackerException):
+    message = _('Creating cluster member based on VNF %(vnf_id)s failed.')
+
+
+class ClusterMemberAttributeInvalid(exceptions.InvalidInput):
+    message = _('Invalid cluster member attribute %(mem_attr)s.')
+
+
+class ClusterMemberRoleInvalid(exceptions.InvalidInput):
+    message = _('Invalid cluster member role %(role)s.')
+
+
+class ClusterMemberCPNotFound(exceptions.NotFound):
+    message = _('Cluster member connection point'
+                ' could not be found in VNF resources.')
+
+
+class ClusterMemberAddFailed(exceptions.TackerException):
+    message = ('Cluster member %(clustermember_id)s '
+               'could not be added to load balancer.')
