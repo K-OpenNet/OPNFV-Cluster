@@ -38,8 +38,8 @@ from tacker.mistral import mistral_client
 from tacker.nfvo.drivers.vim import abstract_vim_driver
 from tacker.nfvo.drivers.vnffg import abstract_vnffg_driver
 from tacker.nfvo.drivers.workflow import workflow_generator
+from tacker.plugins.common import constants
 from tacker.vnfm import keystone
-
 
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
@@ -118,8 +118,11 @@ class OpenStack_Driver(abstract_vim_driver.VimAbstractDriver,
 
         Initialize keystoneclient with provided authentication attributes.
         """
+        verify = 'True' == vim_obj['auth_cred'].get('cert_verify', 'True') \
+                 or False
         auth_url = vim_obj['auth_url']
-        keystone_version = self._validate_auth_url(auth_url)
+        keystone_version = self._validate_auth_url(auth_url=auth_url,
+                                                   verify=verify)
         auth_cred = self._get_auth_creds(keystone_version, vim_obj)
         return self._initialize_keystone(keystone_version, auth_cred)
 
@@ -152,9 +155,9 @@ class OpenStack_Driver(abstract_vim_driver.VimAbstractDriver,
 
         return auth_plugin
 
-    def _validate_auth_url(self, auth_url):
+    def _validate_auth_url(self, auth_url, verify):
         try:
-            keystone_version = self.keystone.get_version(auth_url)
+            keystone_version = self.keystone.get_version(auth_url, verify)
         except Exception as e:
             LOG.error('VIM Auth URL invalid')
             raise nfvo.VimConnectionException(message=str(e))
@@ -333,15 +336,16 @@ class OpenStack_Driver(abstract_vim_driver.VimAbstractDriver,
         :param client_type: openstack client to initialize
         :return: initialized client
         """
+        verify = 'True' == vim_obj.get('cert_verify', 'True') or False
         auth_url = vim_obj['auth_url']
-        keystone_version = self._validate_auth_url(auth_url)
+        keystone_version = self._validate_auth_url(auth_url=auth_url,
+                                                   verify=verify)
         auth_cred = self._get_auth_creds(keystone_version, vim_obj)
         auth_plugin = self._get_auth_plugin(keystone_version, **auth_cred)
         sess = session.Session(auth=auth_plugin)
         return client_type(session=sess)
 
-    def create_flow_classifier(self, name, fc, auth_attr=None):
-        def _translate_ip_protocol(ip_proto):
+    def _translate_ip_protocol(self, ip_proto):
             if ip_proto == '1':
                 return 'icmp'
             elif ip_proto == '6':
@@ -351,25 +355,31 @@ class OpenStack_Driver(abstract_vim_driver.VimAbstractDriver,
             else:
                 return None
 
-        if not auth_attr:
-            LOG.warning("auth information required for n-sfc driver")
-            return None
-
-        LOG.debug('fc passed is %s', fc)
-        sfc_classifier_params = {}
+    def _create_classifier_params(self, fc):
+        classifier_params = {}
         for field in fc:
             if field in FC_MAP:
-                sfc_classifier_params[FC_MAP[field]] = fc[field]
+                classifier_params[FC_MAP[field]] = fc[field]
             elif field == 'ip_proto':
-                protocol = _translate_ip_protocol(str(fc[field]))
+                protocol = self._translate_ip_protocol(str(fc[field]))
                 if not protocol:
                     raise ValueError('protocol %s not supported' % fc[field])
-                sfc_classifier_params['protocol'] = protocol
+                classifier_params['protocol'] = protocol
             else:
                 LOG.warning("flow classifier %s not supported by "
                             "networking-sfc driver", field)
+        return classifier_params
 
+    def create_flow_classifier(self, name, fc, auth_attr=None):
+        if not auth_attr:
+            LOG.warning("auth information required for n-sfc driver")
+            return None
+        fc['name'] = name
+        LOG.debug('fc passed is %s', fc)
+
+        sfc_classifier_params = self._create_classifier_params(fc)
         LOG.debug('sfc_classifier_params is %s', sfc_classifier_params)
+
         if len(sfc_classifier_params) > 0:
             neutronclient_ = NeutronClient(auth_attr)
 
@@ -445,15 +455,112 @@ class OpenStack_Driver(abstract_vim_driver.VimAbstractDriver,
         return neutronclient_.port_chain_create(port_chain)
 
     def update_chain(self, chain_id, fc_ids, vnfs,
-                     symmetrical=False, auth_attr=None):
-        # TODO(s3wong): chain can be updated either for
+                     symmetrical=None, auth_attr=None):
+        # (s3wong): chain can be updated either for
         # the list of fc and/or list of port-pair-group
         # since n-sfc driver does NOT track the ppg id
         # it will look it up (or reconstruct) from
         # networking-sfc DB --- but the caveat is that
         # the VNF name MUST be unique
-        LOG.warning("n-sfc driver does not support sf chain update")
-        raise NotImplementedError('sf chain update not supported')
+
+        # TODO(mardim) Currently we figure out which VNF belongs to what
+        # port-pair-group or port-pair through the name of VNF.
+        # This is not the best approach. The best approach for the future
+        # propably is to maintain in the database the ID of the
+        # port-pair-group and port-pair that VNF belongs to so we can
+        # implemement the update in a more robust way.
+
+        if not auth_attr:
+            LOG.warning("auth information required for n-sfc driver")
+            return None
+
+        neutronclient_ = NeutronClient(auth_attr)
+        new_ppgs = []
+        updated_port_chain = dict()
+        pc_info = neutronclient_.port_chain_show(chain_id)
+        if set(fc_ids) != set(pc_info['port_chain']['flow_classifiers']):
+            updated_port_chain['flow_classifiers'] = fc_ids
+        old_ppgs = pc_info['port_chain']['port_pair_groups']
+        old_ppgs_dict = {neutronclient_.
+                    port_pair_group_show(ppg_id)['port_pair_group']['name'].
+                    split('-')[0]: ppg_id for ppg_id in old_ppgs}
+        past_ppgs_dict = old_ppgs_dict.copy()
+        try:
+            for vnf in vnfs:
+                port_pair_group = {}
+                port_pair = {}
+                if vnf['name'] in old_ppgs_dict:
+                    old_ppg_id = old_ppgs_dict.pop(vnf['name'])
+                    new_ppgs.append(old_ppg_id)
+                else:
+                    port_pair_group['name'] = vnf['name'] + '-port-pair-group'
+                    port_pair_group['description'] = \
+                        'port pair group for %s' % vnf['name']
+                    port_pair_group['port_pairs'] = []
+
+                    if CONNECTION_POINT not in vnf:
+                        LOG.warning("Chain update failed due to missing "
+                                    "connection point info in VNF "
+                                    "%(vnfname)s", {'vnfname': vnf['name']})
+                        raise nfvo.UpdateChainException(
+                            message="Connection point not found")
+                    cp_list = vnf[CONNECTION_POINT]
+                    num_cps = len(cp_list)
+                    if num_cps != 1 and num_cps != 2:
+                        LOG.warning("Chain update failed due to wrong number "
+                                    "of connection points: expected [1 | 2],"
+                                    "got %(cps)d", {'cps': num_cps})
+                        raise nfvo.UpdateChainException(
+                            message="Invalid number of connection points")
+                    port_pair['name'] = vnf['name'] + '-connection-points'
+                    port_pair['description'] = 'port pair for %s' % vnf['name']
+                    if num_cps == 1:
+                        port_pair['ingress'] = cp_list[0]
+                        port_pair['egress'] = cp_list[0]
+                    else:
+                        port_pair['ingress'] = cp_list[0]
+                        port_pair['egress'] = cp_list[1]
+                    port_pair_id = neutronclient_.port_pair_create(port_pair)
+                    if not port_pair_id:
+                        LOG.warning("Chain update failed due to port pair "
+                                    "creation failed for "
+                                    "vnf %(vnf)s", {'vnf': vnf['name']})
+                        raise nfvo.UpdateChainException(
+                            message="Failed to create port-pair")
+                    port_pair_group['port_pairs'].append(port_pair_id)
+                    port_pair_group_id = \
+                        neutronclient_.port_pair_group_create(port_pair_group)
+                    if not port_pair_group_id:
+                        LOG.warning("Chain update failed due to port pair "
+                                    "group creation failed for vnf "
+                                    "%(vnf)s", {'vnf': vnf['name']})
+                        for pp_id in port_pair_group['port_pairs']:
+                            neutronclient_.port_pair_delete(pp_id)
+                        raise nfvo.UpdateChainException(
+                            message="Failed to create port-pair-group")
+                    new_ppgs.append(port_pair_group_id)
+        except nfvo.UpdateChainException as e:
+            self._delete_ppgs_and_pps(neutronclient_, new_ppgs, past_ppgs_dict)
+            raise e
+
+        updated_port_chain['port_pair_groups'] = new_ppgs
+        updated_port_chain['flow_classifiers'] = fc_ids
+        try:
+            pc_id = neutronclient_.port_chain_update(chain_id,
+                                                     updated_port_chain)
+        except (nc_exceptions.BadRequest, nfvo.UpdateChainException) as e:
+            self._delete_ppgs_and_pps(neutronclient_, new_ppgs, past_ppgs_dict)
+            raise e
+        for ppg_name in old_ppgs_dict:
+            ppg_info = neutronclient_. \
+                port_pair_group_show(old_ppgs_dict[ppg_name])
+            neutronclient_.port_pair_group_delete(old_ppgs_dict[ppg_name])
+            port_pairs = ppg_info['port_pair_group']['port_pairs']
+            if port_pairs and len(port_pairs):
+                for j in xrange(0, len(port_pairs)):
+                    pp_id = port_pairs[j]
+                    neutronclient_.port_pair_delete(pp_id)
+        return pc_id
 
     def delete_chain(self, chain_id, auth_attr=None):
         if not auth_attr:
@@ -463,28 +570,89 @@ class OpenStack_Driver(abstract_vim_driver.VimAbstractDriver,
         neutronclient_ = NeutronClient(auth_attr)
         neutronclient_.port_chain_delete(chain_id)
 
-    def update_flow_classifier(self, fc_id, fc, auth_attr=None):
+    def update_flow_classifier(self, chain_id, fc, auth_attr=None):
         if not auth_attr:
             LOG.warning("auth information required for n-sfc driver")
             return None
 
-        # for now, the only parameters allowed for flow-classifier-update
-        # is 'name' and/or 'description'.
-        # Currently we do not store the classifiers in the db with
-        # a name and/or a description which means that the default
-        # values of the name and/or description will be None.
+        fc_id = fc.pop('instance_id')
+        fc_status = fc.pop('status')
+        match_dict = fc.pop('match')
+        fc.update(match_dict)
 
-        sfc_classifier_params = {}
-        if 'name' in fc:
-            sfc_classifier_params['name'] = fc['name']
-        if 'description' in fc:
-            sfc_classifier_params['description'] = fc['description']
-
-        LOG.debug('sfc_classifier_params is %s', sfc_classifier_params)
-
+        sfc_classifier_params = self._create_classifier_params(fc)
         neutronclient_ = NeutronClient(auth_attr)
-        return neutronclient_.flow_classifier_update(fc_id,
-                                                     sfc_classifier_params)
+        if fc_status == constants.PENDING_UPDATE:
+            fc_info = neutronclient_.flow_classifier_show(fc_id)
+            for field in sfc_classifier_params:
+                # If the new classifier is the same with the old one then
+                # no change needed.
+                if (fc_info['flow_classifier'].get(field) is not None) and \
+                        (sfc_classifier_params[field] == fc_info[
+                            'flow_classifier'][field]):
+                    continue
+
+                # If the new classifier has different match criteria
+                # with the old one then we strip the classifier from
+                # the chain we delete the old classifier and we create
+                # a new one with the same name as before but with different
+                # match criteria. We are not using the flow_classifier_update
+                # from the n-sfc because it does not support match criteria
+                # update for an existing classifier yet.
+                else:
+                    try:
+                        self._dissociate_classifier_from_chain(chain_id,
+                                                               [fc_id],
+                                                               neutronclient_)
+                    except Exception as e:
+                        raise e
+                    fc_id = neutronclient_.flow_classifier_create(
+                        sfc_classifier_params)
+                    if fc_id is None:
+                        raise nfvo.UpdateClassifierException(
+                            message="Failed to update classifiers")
+                    break
+
+        # If the new classifier is completely different from the existing
+        # ones (name and match criteria) then we just create it.
+        else:
+            fc_id = neutronclient_.flow_classifier_create(
+                sfc_classifier_params)
+            if fc_id is None:
+                raise nfvo.UpdateClassifierException(
+                    message="Failed to update classifiers")
+
+        return fc_id
+
+    def _dissociate_classifier_from_chain(self, chain_id, fc_ids,
+                                          neutronclient):
+            pc_info = neutronclient.port_chain_show(chain_id)
+            current_fc_list = pc_info['port_chain']['flow_classifiers']
+            for fc_id in fc_ids:
+                current_fc_list.remove(fc_id)
+            pc_id = neutronclient.port_chain_update(chain_id,
+                    {'flow_classifiers': current_fc_list})
+            if pc_id is None:
+                raise nfvo.UpdateClassifierException(
+                    message="Failed to update classifiers")
+            for fc_id in fc_ids:
+                try:
+                    neutronclient.flow_classifier_delete(fc_id)
+                except ValueError as e:
+                    raise e
+
+    def remove_and_delete_flow_classifiers(self, chain_id, fc_ids,
+                                           auth_attr=None):
+        if not auth_attr:
+            LOG.warning("auth information required for n-sfc driver")
+            raise EnvironmentError('auth attribute required for'
+                                   ' networking-sfc driver')
+        neutronclient_ = NeutronClient(auth_attr)
+        try:
+            self._dissociate_classifier_from_chain(chain_id, fc_ids,
+                                                   neutronclient_)
+        except Exception as e:
+            raise e
 
     def delete_flow_classifier(self, fc_id, auth_attr=None):
         if not auth_attr:
@@ -516,143 +684,235 @@ class OpenStack_Driver(abstract_vim_driver.VimAbstractDriver,
         return {'id': workflow[0].id, 'input': wg.get_input_dict()}
 
     def execute_workflow(self, workflow, auth_dict=None):
-        return self.get_mistral_client(auth_dict)\
+        return self.get_mistral_client(auth_dict) \
             .executions.create(
-                workflow_identifier=workflow['id'],
-                workflow_input=workflow['input'],
-                wf_params={})
+            workflow_identifier=workflow['id'],
+            workflow_input=workflow['input'],
+            wf_params={})
 
     def get_execution(self, execution_id, auth_dict=None):
-        return self.get_mistral_client(auth_dict)\
+        return self.get_mistral_client(auth_dict) \
             .executions.get(execution_id)
 
     def delete_execution(self, execution_id, auth_dict=None):
-        return self.get_mistral_client(auth_dict).executions\
+        return self.get_mistral_client(auth_dict).executions \
             .delete(execution_id)
 
     def delete_workflow(self, workflow_id, auth_dict=None):
-        return self.get_mistral_client(auth_dict)\
+        return self.get_mistral_client(auth_dict) \
             .workflows.delete(workflow_id)
 
-    def _wait_for_lb_ready(self, neutron_client, lb_id,
-                           ignore_not_found=False):
-        lb_status_timeout = 120
+    def _delete_ppgs_and_pps(self, neutronclient, new_ppgs, past_ppgs_dict):
+        if new_ppgs:
+            for item in new_ppgs:
+                if item not in past_ppgs_dict.values():
+                    new_ppg_info = neutronclient.port_pair_group_show(
+                        item)
+                    neutronclient.port_pair_group_delete(item)
+                    new_port_pairs = new_ppg_info['port_pair_group'][
+                        'port_pairs']
+                    if new_port_pairs and len(new_port_pairs):
+                        for j in xrange(0, len(new_port_pairs)):
+                            new_pp_id = new_port_pairs[j]
+                            neutronclient.port_pair_delete(new_pp_id)
+
+    def _wait_for_lb_ready(self, neutron_client, lb_id):
+        lb_status = False
+        timeout = 120
         timer = 0
-        lb_ready = False
-        while timer < lb_status_timeout:
+        while timer < timeout:
             lb_resource = neutron_client.\
                 find_resource_by_name_or_id('loadbalancer', lb_id)
             if lb_resource is None:
-                lb_ready = ignore_not_found
+                lb_status = False
+                break
             else:
-                lb_ready = \
-                    ((lb_resource.get('provisioning_status') == 'ACTIVE')
-                     and
-                     (lb_resource.get('operating_status') == 'ONLINE'))
-            if lb_ready is True:
-                return True
-            eventlet.sleep(1)
+                failed_prov_status = {'ERROR'}
+                failed_oper_status = {'DEGRADED', 'ERROR'}
+                prov_status = lb_resource.get('provisioning_status')
+                oper_status = lb_resource.get('operating_status')
+                if prov_status == 'ACTIVE' and oper_status == 'ONLINE':
+                    lb_status = True
+                    break
+                elif prov_status in failed_prov_status \
+                        or oper_status in failed_oper_status:
+                    lb_status = False
+                    break
+            eventlet.sleep(2)
             timer += 1
-        return False
+        return lb_status
 
-    def create_loadbalancer(self, lb_pool, lb_vip, auth_attr=None):
-        result = {}
+    def create_loadbalancer(self, lb_pool, lb_vip, lb_listener,
+                            auth_attr=None):
+        lb_dict = dict()
         if not auth_attr:
-            LOG.warning(_("auth information required for n-sfc driver"))
+            LOG.warning("auth information required for neutron-lbaas service")
             raise EnvironmentError('auth attribute required for'
-                                   ' networking-sfc driver')
+                                   ' neutron-lbaas service')
         neutron_client = NeutronClient(auth_attr)
-        subnet_id = neutron_client.subnet_get(lb_vip['subnet'])
-        result['subnet_id'] = subnet_id
-        lb = neutron_client.loadbalancer_create(subnet_id,
-                                                lb_vip.get('address', None))
-        lb_id = lb.get('loadbalancer').get('id')
-        LOG.debug(_("create_loadbalancer lb_id : %s"), lb_id)
-        res = self._wait_for_lb_ready(neutron_client, lb_id)
+        try:
+            lb_id = None
+            pool_id = None
+            listener_id = None
+            # Checking algorithm validation
+            lb_algorithms = ['SOURCE_IP', 'ROUND_ROBIN', 'LEAST_CONNECTIONS']
+            lb_algorithm = lb_pool['lb_algorithm'].upper()
+            if lb_algorithm not in lb_algorithms:
+                raise nfvo.\
+                    LBUnsupportedAlgorithmTypeException(type=lb_algorithm)
+            # Checking protocol validation
+            lb_protocols = ['TCP', 'HTTP', 'HTTPS',
+                            'TERMINATED_HTTPS', 'PROXY']
+            listener_protocol = lb_listener['protocol'].upper()
+            pool_protocol = lb_pool['protocol'].upper()
+            if listener_protocol not in lb_protocols:
+                raise nfvo.\
+                    LBUnsupportedProtocolTypeException(type=listener_protocol)
+            elif pool_protocol not in lb_protocols:
+                raise nfvo.\
+                    LBUnsupportedProtocolTypeException(type=pool_protocol)
 
-        if res is False:
-            LOG.error("Load balancer status is PENDING_CREATE...")
+            # Create lbaas-loadbalancer
+            subnet_id = neutron_client.subnet_get(lb_vip['subnet'])
+            lb_dict['subnet_id'] = subnet_id
+            vip_address = lb_vip.get('vip_address', None)
+
+            lb_result = \
+                neutron_client.loadbalancer_create(subnet_id, vip_address)
+            lb_id = lb_result.get('loadbalancer').get('id')
+
+            LOG.debug('Creating lbaas-loadbalancer %s', lb_id)
+            lb_status = self._wait_for_lb_ready(neutron_client, lb_id)
+            if lb_status is False:
+                LOG.error("Creating load balancer based on %s failed.", lb_id)
+                # Delete lbaas-loadbalancer
+                self.delete_loadbalancer(lb_id=lb_id, auth_attr=auth_attr)
+                return None
+
+            lb_dict['lb_id'] = lb_id
+            lb_dict['vip_address'] = \
+                lb_result['loadbalancer'].get('vip_address')
+
+            # Create lbaas-listener
+            protocol_port = lb_listener['protocol_port']
+            connection_limit = lb_listener.get('connection_limit', None)
+            listener_dict = neutron_client.listener_create(lb_id,
+                                                           listener_protocol,
+                                                           protocol_port,
+                                                           connection_limit)
+            listener_id = listener_dict.get('listener').get('id')
+            lb_dict['listener_id'] = listener_id
+
+            LOG.debug('Adding lbaas-listener %s to load balancer %s',
+                      listener_id, lb_id)
+            lb_status = self._wait_for_lb_ready(neutron_client, lb_id)
+            if lb_status is False:
+                LOG.error('Listener %s could not be added in Load balancer %s',
+                          listener_id, lb_id)
+                # Delete load balancer and listener
+                self.delete_loadbalancer(lb_id=lb_id, listener_id=listener_id,
+                                         auth_attr=auth_attr)
+                return None
+
+            # Create lbaas-pool
+            pool_dict = neutron_client.pool_create(listener_id, lb_algorithm,
+                                                   pool_protocol)
+            pool_id = pool_dict.get('pool').get('id')
+            lb_dict['pool_id'] = pool_id
+
+            LOG.debug('Adding lbaas-pool %s to lbaas-listener %s',
+                      pool_id, listener_id)
+            lb_status = self._wait_for_lb_ready(neutron_client, lb_id)
+            if lb_status is False:
+                LOG.error('Pool %s could not be added in Load balancer %s',
+                          pool_id, lb_id)
+                # Delete load balancer, pool and listener
+                self.delete_loadbalancer(lb_id=lb_id, pool_id=pool_id,
+                                         listener_id=listener_id,
+                                         auth_attr=auth_attr)
+                return None
+            lb_dict['protocol_port'] = protocol_port
+            LOG.debug('Load balancer %s has been created', lb_id)
+        except Exception:
+            LOG.error('Invalid load balancer configuration.')
+            if lb_id is not None:
+                self.delete_loadbalancer(lb_id=lb_id, pool_id=pool_id,
+                                         listener_id=listener_id,
+                                         auth_attr=auth_attr)
             return None
+        return lb_dict
 
-        result['loadbalancer'] = lb_id
-        result['vip_address'] = lb['loadbalancer'].get('vip_address')
-
-        listener = \
-            neutron_client.listener_create(lb_id,
-                                           lb_vip['protocol'],
-                                           lb_vip['protocol_port'],
-                                           lb_vip.get('connection_limit',
-                                                      None))
-        listener_id = listener.get('listener').get('id')
-        result['listener'] = listener_id
-        res = self._wait_for_lb_ready(neutron_client, lb_id)
-        if res is False:
-            LOG.error("Load balancer status is PENDING_CREATE...")
-            return None
-
-        lb_pool = neutron_client.pool_create(lb_pool['lb_method'],
-                                             listener_id,
-                                             lb_pool['protocol'])
-        pool_id = lb_pool.get('pool').get('id')
-        result['pool'] = pool_id
-        res = self._wait_for_lb_ready(neutron_client, lb_id)
-        if res is False:
-            LOG.error("Load balancer status is PENDING_CREATE...")
-            return None
-        result['protocol_port'] = lb_vip['protocol_port']
-        return result
-
-    def delete_loadbalancer(self, lb_id, lb_pool, lb_listener, auth_attr=None):
+    def delete_loadbalancer(self, lb_id, pool_id=None, listener_id=None,
+                            auth_attr=None):
         if not auth_attr:
-            LOG.warning(_("auth information required for n-sfc driver"))
+            LOG.warning("auth information required for neutron-lbaas service")
             raise EnvironmentError('auth attribute required for'
-                                   ' networking-sfc driver')
+                                   ' neutron-lbaas service')
         neutron_client = NeutronClient(auth_attr)
-        neutron_client.pool_delete(lb_pool)
-        self._wait_for_lb_ready(neutron_client, lb_id)
-        neutron_client.listener_delete(lb_listener)
-        self._wait_for_lb_ready(neutron_client, lb_id)
+
+        # Delete lbaas-pool
+        if pool_id is not None:
+            LOG.debug('Deleting lbaas-pool %s', pool_id)
+            neutron_client.pool_delete(pool_id)
+            self._wait_for_lb_ready(neutron_client, lb_id)
+
+        # Delete lbaas-listener
+        if listener_id is not None:
+            LOG.debug('Deleting lbaas-listener %s', listener_id)
+            neutron_client.listener_delete(listener_id)
+            self._wait_for_lb_ready(neutron_client, lb_id)
+
+        # Delete lbaas-loadbalancer
+        LOG.debug('Deleting lbaas-loadbalancer %s', lb_id)
         neutron_client.loadbalancer_delete(lb_id)
         LOG.debug('Load balancer %s has been deleted', lb_id)
 
-    def pool_member_add(self, net_port_id, lb_info, auth_attr=None):
-        """Add a member to Neutron lbaas pool."""
+    def pool_member_add(self, net_port_id, lb_info, weight=None,
+                        auth_attr=None):
+        """Add a member to Neutron lbaas-pool."""
         if not auth_attr:
-            LOG.warning(_("auth information required for n-sfc driver"))
+            LOG.warning("auth information required for neutron-lbaas service")
             raise EnvironmentError('auth attribute required for'
-                                   ' networking-sfc driver')
-        lb_id = lb_info['loadbalancer']
-        neutronclient_ = NeutronClient(auth_attr)
-        port_info = neutronclient_.find_port_info_by_port_id(net_port_id)
-        address = port_info['port']['fixed_ips'][0]['ip_address']
-        LOG.debug(_("pool_member_add lb_id : %s"), lb_id)
-        LOG.debug(_("pool_member_add address : %s"), address)
-        res = self._wait_for_lb_ready(neutronclient_, lb_id)
-        if not res:
-            LOG.warning(('Loadbalancer %s is not ready.'),
-                        lb_info['loadbalancer'])
+                                   ' neutron-lbaas service')
+        neutronclient = NeutronClient(auth_attr)
+
+        lb_id = lb_info['lb_id']
+        port_info = neutronclient.find_port_info_by_port_id(net_port_id)
+        ip_address = port_info['port']['fixed_ips'][0]['ip_address']
+
+        lb_status = self._wait_for_lb_ready(neutronclient, lb_id)
+        if lb_status is False:
+            LOG.error(('Load balancer %s is not ready.'), lb_id)
             return None
-        member = neutronclient_.pool_member_create(lb_info['pool'], address,
-                                                   lb_info['protocol_port'],
-                                                   lb_info['subnet_id'])
+        member = neutronclient.pool_member_create(lb_info['pool_id'],
+                                                  ip_address,
+                                                  lb_info['protocol_port'],
+                                                  lb_info['subnet_id'],
+                                                  weight)
         member_id = member['member']['id']
-        LOG.debug(_("member_add member_id : %s"), member_id)
-        res = self._wait_for_lb_ready(neutronclient_, lb_id)
-        if res is False:
-            LOG.warning(_('Failed in creating pool member (%s).'), member_id)
+        LOG.debug('Adding member %s to lbaas-loadbalancer %s',
+                  member_id, lb_id)
+        lb_status = self._wait_for_lb_ready(neutronclient, lb_id)
+        if lb_status is False:
+            LOG.warning(_('Failed in adding pool member %s.'), member_id)
             return None
 
+        LOG.debug('Member pool %s has been added to lbaas-loadbalancer %s',
+                  member_id, lb_id)
         return member_id
 
     def pool_member_remove(self, lb_id, pool_id, member_id, auth_attr=None):
-        LOG.debug(_("pool_member_remove lb_id : %s"), lb_id)
-        LOG.debug(_("pool_member_remove pool_id : %s"), pool_id)
-        LOG.debug(_("pool_member_remove member_id : %s"), member_id)
+        if not auth_attr:
+            LOG.warning("auth information required for neutron-lbaas service")
+            raise EnvironmentError('auth attribute required for'
+                                   ' neutron-lbaas service')
         neutronclient_ = NeutronClient(auth_attr)
+
         neutronclient_.pool_member_delete(pool_id, member_id)
-        LOG.debug(_("member_add member_id : %s"), member_id)
-        res = self._wait_for_lb_ready(neutronclient_, lb_id)
-        if res is False:
+        LOG.debug('Delete member %s from lbaas-loadbalancer %s',
+                  member_id, lb_id)
+        lb_status = self._wait_for_lb_ready(neutronclient_, lb_id)
+        if lb_status is False:
             LOG.warning(_('Failed in deleting pool member (%s).'), member_id)
             return None
 
@@ -661,9 +921,21 @@ class NeutronClient(object):
     """Neutron Client class for networking-sfc driver"""
 
     def __init__(self, auth_attr):
-        auth = identity.Password(**auth_attr)
-        sess = session.Session(auth=auth)
+        auth_cred = auth_attr.copy()
+        verify = 'True' == auth_cred.pop('cert_verify', 'True') or False
+        auth = identity.Password(**auth_cred)
+        sess = session.Session(auth=auth, verify=verify)
         self.client = neutron_client.Client(session=sess)
+
+    def flow_classifier_show(self, fc_id):
+        try:
+            fc = self.client.show_flow_classifier(fc_id)
+            if fc is None:
+                raise ValueError('classifier %s not found' % fc_id)
+            return fc
+        except nc_exceptions.NotFound:
+            LOG.error('classifier %s not found', fc_id)
+            raise ValueError('classifier %s not found' % fc_id)
 
     def flow_classifier_create(self, fc_dict):
         LOG.debug("fc_dict passed is {fc_dict}".format(fc_dict=fc_dict))
@@ -756,6 +1028,41 @@ class NeutronClient(object):
             LOG.warning('port chain %s not found', port_chain_id)
             raise ValueError('port chain %s not found' % port_chain_id)
 
+    def port_chain_update(self, port_chain_id, port_chain):
+        try:
+            pc = self.client.update_port_chain(port_chain_id,
+                                    {'port_chain': port_chain})
+        except nc_exceptions.BadRequest as e:
+            LOG.warning('update port chain returns %s', e)
+            raise ValueError(str(e))
+        if pc and len(pc):
+            return pc['port_chain']['id']
+        else:
+            raise nfvo.UpdateChainException(message="Failed to update "
+                                                    "port-chain")
+
+    def port_chain_show(self, port_chain_id):
+        try:
+            port_chain = self.client.show_port_chain(port_chain_id)
+            if port_chain is None:
+                raise ValueError('port chain %s not found' % port_chain_id)
+
+            return port_chain
+        except nc_exceptions.NotFound:
+            LOG.error('port chain %s not found', port_chain_id)
+            raise ValueError('port chain %s not found' % port_chain_id)
+
+    def port_pair_group_show(self, ppg_id):
+        try:
+            port_pair_group = self.client.show_port_pair_group(ppg_id)
+            if port_pair_group is None:
+                raise ValueError('port pair group %s not found' % ppg_id)
+
+            return port_pair_group
+        except nc_exceptions.NotFound:
+            LOG.warning('port pair group %s not found', ppg_id)
+            raise ValueError('port pair group %s not found' % ppg_id)
+
     def find_port_info_by_port_id(self, port_id):
         port_info = self.client.show_port(port_id)
         LOG.debug(("find_address_by_port_id port_info: {port_info}").
@@ -774,106 +1081,99 @@ class NeutronClient(object):
 
     def network_get(self, name_or_id, ignore_missing=False):
         network = self.client.find_network(name_or_id, ignore_missing)
+        if network is None:
+            raise ValueError('Network %s not found' % name_or_id)
         return network
 
     def port_find(self, name_or_id, ignore_missing=False):
         port = self.client.find_port(name_or_id, ignore_missing)
+        if port is None:
+            raise ValueError('Port %s not found' % name_or_id)
         return port
 
     def subnet_get(self, name_or_id, ignore_missing=False):
-        subnet_id = self.find_resourceid_by_name_or_id('subnet',
-                                                       name_or_id)
-        LOG.debug(_('subnet_get subnet %s') % subnet_id)
-        return subnet_id
+        subnet = self.find_resourceid_by_name_or_id('subnet',
+                                                    name_or_id)
+        if subnet is None:
+            raise ValueError('Subnet %s not found' % name_or_id)
+        return subnet
 
     def loadbalancer_get(self, name_or_id, ignore_missing=False):
-        lb = self.client.find_load_balancer(name_or_id, ignore_missing)
-        return lb
+        lb_dict = self.client.find_load_balancer(name_or_id, ignore_missing)
+        if lb_dict is None:
+            raise ValueError('Load balancer %s not found' % name_or_id)
+        return lb_dict
 
-    def loadbalancer_create(self, vip_subnet_id, vip_address=None,
+    def loadbalancer_create(self, vip_subnet_id, vip_address,
                             admin_state_up=True, name=None, description=None):
 
-        kwargs = {
-            'vip_subnet_id': vip_subnet_id,
-            'admin_state_up': admin_state_up,
-        }
-
+        lb_config = dict(vip_subnet_id=vip_subnet_id,
+                         admin_state_up=admin_state_up)
         if vip_address is not None:
-            kwargs['vip_address'] = vip_address
+            lb_config['vip_address'] = vip_address
         if name is not None:
-            kwargs['name'] = name
+            lb_config['name'] = name
         if description is not None:
-            kwargs['description'] = description
+            lb_config['description'] = description
 
-        res = self.client.create_loadbalancer({'loadbalancer': kwargs})
-        return res
+        lb_dict = self.client.create_loadbalancer(dict(loadbalancer=lb_config))
+        return lb_dict
 
     def loadbalancer_delete(self, lb_id):
         self.client.delete_loadbalancer(lb_id)
-        return
 
-    def listener_create(self, loadbalancer_id, protocol, protocol_port,
-                        connection_limit=None,
-                        admin_state_up=True, name=None, description=None):
+    def listener_create(self, lb_id, protocol, protocol_port,
+                        connection_limit, admin_state_up=True,
+                        name=None, description=None):
 
-        kwargs = {
-            'loadbalancer_id': loadbalancer_id,
-            'protocol': protocol,
-            'protocol_port': protocol_port,
-            'admin_state_up': admin_state_up,
-        }
-
+        listener_config = dict(loadbalancer_id=lb_id,
+                               protocol=protocol,
+                               protocol_port=protocol_port,
+                               admin_state_up=admin_state_up)
         if connection_limit is not None:
-            kwargs['connection_limit'] = connection_limit
+            listener_config['connection_limit'] = connection_limit
         if name is not None:
-            kwargs['name'] = name
+            listener_config['name'] = name
         if description is not None:
-            kwargs['description'] = description
+            listener_config['description'] = description
 
-        res = self.client.create_listener({'listener': kwargs})
-        return res
+        listener_dict = \
+            self.client.create_listener(dict(listener=listener_config))
+        return listener_dict
 
     def listener_delete(self, listener_id):
         self.client.delete_listener(listener_id)
-        return
 
-    def pool_create(self, lb_algorithm, listener_id, protocol,
+    def pool_create(self, listener_id, lb_algorithm, protocol,
                     admin_state_up=True, name=None, description=None):
-        kwargs = {
-            'lb_algorithm': lb_algorithm,
-            'listener_id': listener_id,
-            'protocol': protocol,
-            'admin_state_up': admin_state_up,
-        }
-
+        pool_config = dict(lb_algorithm=lb_algorithm,
+                           listener_id=listener_id,
+                           protocol=protocol,
+                           admin_state_up=admin_state_up)
         if name is not None:
-            kwargs['name'] = name
+            pool_config['name'] = name
         if description is not None:
-            kwargs['description'] = description
+            pool_config['description'] = description
 
-        res = self.client.create_lbaas_pool({'pool': kwargs})
-        return res
+        pool_dict = self.client.create_lbaas_pool(dict(pool=pool_config))
+        return pool_dict
 
     def pool_delete(self, pool_id):
         self.client.delete_lbaas_pool(pool_id)
-        return
 
     def pool_member_create(self, pool_id, address, protocol_port, subnet_id,
-                           weight=None, admin_state_up=True):
-
-        kwargs = {
-            'address': address,
-            'protocol_port': protocol_port,
-            'admin_state_up': admin_state_up,
-            'subnet_id': subnet_id,
-        }
-
+                           weight, admin_state_up=True):
+        member_config = dict(address=address,
+                             protocol_port=protocol_port,
+                             admin_state_up=admin_state_up,
+                             subnet_id=subnet_id)
         if weight is not None:
-            kwargs['weight'] = weight
+            member_config['weight'] = weight
 
-        res = self.client.create_lbaas_member(pool_id, {'member': kwargs})
-        return res
+        member_dict = \
+            self.client.create_lbaas_member(pool_id,
+                                            dict(member=member_config))
+        return member_dict
 
     def pool_member_delete(self, pool_id, member_id):
         self.client.delete_lbaas_member(member_id, pool_id)
-        return

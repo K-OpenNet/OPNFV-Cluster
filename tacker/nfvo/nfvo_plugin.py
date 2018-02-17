@@ -39,6 +39,7 @@ from tacker.db.nfvo import vnfcluster_db
 from tacker.db.nfvo import vnffg_db
 from tacker.extensions import common_services as cs
 from tacker.extensions import nfvo
+from tacker.extensions.nfvo_plugins import vnfcluster
 from tacker.keymgr import API as KEYMGR_API
 from tacker import manager
 from tacker.nfvo.workflows.vim_monitor import vim_monitor_utils
@@ -255,7 +256,7 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
         known_forwarders = set()
         for element in path:
             if element.get('forwarder') in known_forwarders:
-                if prev_element is not None and element.get('forwarder')\
+                if prev_element is not None and element.get('forwarder') \
                         != prev_element['forwarder']:
                     raise nfvo.VnffgdDuplicateForwarderException(
                         forwarder=element.get('forwarder')
@@ -324,12 +325,12 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
         nfp = super(NfvoPlugin, self).get_nfp(context,
                                               vnffg_dict['forwarding_paths'])
         sfc = super(NfvoPlugin, self).get_sfc(context, nfp['chain_id'])
-        matches = []
+        classifier_dict = dict()
+        name_match_list = []
         for classifier_id in nfp['classifier_ids']:
-            matches.append(super(NfvoPlugin, self).
-                    get_classifier(context,
-                                   classifier_id,
-                                   fields='match')['match'])
+            classifier_dict = super(NfvoPlugin, self).get_classifier(
+                context, classifier_id, fields=['name', 'match'])
+            name_match_list.append(classifier_dict)
         # grab the first VNF to check it's VIM type
         # we have already checked that all VNFs are in the same VIM
         vim_obj = self._get_vim_from_vnf(context,
@@ -340,11 +341,11 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
         driver_type = vim_obj['type']
         try:
             fc_ids = []
-            for match in matches:
+            for item in name_match_list:
                 fc_ids.append(self._vim_drivers.invoke(driver_type,
                                              'create_flow_classifier',
-                                             name=vnffg_dict['name'],
-                                             fc=match,
+                                             name=item['name'],
+                                             fc=item['match'],
                                              auth_attr=vim_obj['auth_cred']))
             sfc_id = self._vim_drivers.invoke(driver_type,
                                               'create_chain',
@@ -366,78 +367,105 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
 
     @log.log
     def update_vnffg(self, context, vnffg_id, vnffg):
-        vnffg_dict = super(NfvoPlugin, self)._update_vnffg_pre(context,
-                                                               vnffg_id)
-        new_vnffg = vnffg['vnffg']
-        LOG.debug('vnffg update: %s', vnffg)
+        vnffg_info = vnffg['vnffg']
+        # put vnffg related objects in PENDING_UPDATE status
+        vnffg_old = super(NfvoPlugin, self)._update_vnffg_status_pre(
+            context, vnffg_id)
+        name = vnffg_old['name']
+
+        # create inline vnffgd if given by user
+        if vnffg_info.get('vnffgd_template'):
+            vnffgd_name = utils.generate_resource_name(name, 'inline')
+            vnffgd = {'vnffgd': {'tenant_id': vnffg_old['tenant_id'],
+                                 'name': vnffgd_name,
+                                 'template': {
+                                     'vnffgd': vnffg_info['vnffgd_template']},
+                                 'template_source': 'inline',
+                                 'description': vnffg_old['description']}}
+            try:
+                vnffg_info['vnffgd_id'] = \
+                    self.create_vnffgd(context, vnffgd).get('id')
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    super(NfvoPlugin, self)._update_vnffg_status_post(context,
+                        vnffg_old, error=True, db_state=constants.ACTIVE)
+        try:
+
+            vnffg_dict = super(NfvoPlugin, self). \
+                _update_vnffg_pre(context, vnffg, vnffg_id, vnffg_old)
+
+        except (nfvo.VnfMappingNotFoundException,
+                nfvo.VnfMappingNotValidException):
+            with excutils.save_and_reraise_exception():
+
+                if vnffg_info.get('vnffgd_template'):
+                    super(NfvoPlugin, self).delete_vnffgd(
+                        context, vnffg_info['vnffgd_id'])
+
+                super(NfvoPlugin, self)._update_vnffg_status_post(
+                    context, vnffg_old, error=True, db_state=constants.ACTIVE)
+        except nfvo.UpdateVnffgException:
+            with excutils.save_and_reraise_exception():
+                super(NfvoPlugin, self).delete_vnffgd(context,
+                                                      vnffg_info['vnffgd_id'])
+
+                super(NfvoPlugin, self)._update_vnffg_status_post(context,
+                                                                  vnffg_old,
+                                                                  error=True)
+
         nfp = super(NfvoPlugin, self).get_nfp(context,
                                               vnffg_dict['forwarding_paths'])
         sfc = super(NfvoPlugin, self).get_sfc(context, nfp['chain_id'])
 
-        classifiers = [super(NfvoPlugin, self).
-                       get_classifier(context, classifier_id) for classifier_id
-                       in nfp['classifier_ids']]
-        template_db = self._get_resource(context, vnffg_db.VnffgTemplate,
-                                         vnffg_dict['vnffgd_id'])
-        vnf_members = self._get_vnffg_property(template_db.template,
-                                               'constituent_vnfs')
-        new_vnffg['vnf_mapping'] = super(NfvoPlugin, self)._get_vnf_mapping(
-            context, new_vnffg.get('vnf_mapping'), vnf_members)
-        template_id = vnffg_dict['vnffgd_id']
-        template_db = self._get_resource(context, vnffg_db.VnffgTemplate,
-                                         template_id)
-        # functional attributes that allow update are vnf_mapping,
-        # and symmetrical.  Therefore we need to figure out the new chain if
-        # it was updated by new vnf_mapping.  Symmetrical is handled by driver.
+        classifier_dict = dict()
+        classifier_update = []
+        classifier_delete_ids = []
+        classifier_ids = []
+        for classifier_id in nfp['classifier_ids']:
+            classifier_dict = super(NfvoPlugin, self).get_classifier(
+                context, classifier_id, fields=['id', 'name', 'match',
+                    'instance_id', 'status'])
+            if classifier_dict['status'] == constants.PENDING_DELETE:
+                classifier_delete_ids.append(
+                    classifier_dict.pop('instance_id'))
+            else:
+                classifier_ids.append(classifier_dict.pop('id'))
+                classifier_update.append(classifier_dict)
 
-        chain = super(NfvoPlugin, self)._create_port_chain(context,
-                                                           new_vnffg[
-                                                               'vnf_mapping'],
-                                                           template_db,
-                                                           nfp['name'])
-        LOG.debug('chain update: %s', chain)
-        sfc['chain'] = chain
-        sfc['symmetrical'] = new_vnffg['symmetrical']
+        # TODO(gongysh) support different vim for each vnf
         vim_obj = self._get_vim_from_vnf(context,
                                          list(vnffg_dict[
                                               'vnf_mapping'].values())[0])
         driver_type = vim_obj['type']
         try:
-            # we don't support updating the match criteria in first iteration
-            # so this is essentially a noop.  Good to keep for future use
-            # though.
-            # In addition to that the code we are adding for the multiple
-            # classifier support is also a noop and we are adding it so we
-            # do not get compilation errors. It should be changed when the
-            # update of the classifier will be supported.
-            classifier_instances = []
-            for classifier in classifiers:
-                self._vim_drivers.invoke(driver_type, 'update_flow_classifier',
-                                         fc_id=classifier['instance_id'],
-                                         fc=classifier['match'],
-                                         auth_attr=vim_obj['auth_cred'])
-                classifier_instances.append(classifier['instance_id'])
-            self._vim_drivers.invoke(driver_type, 'update_chain',
-                                     vnfs=sfc['chain'],
-                                     fc_ids=classifier_instances,
+            fc_ids = []
+            self._vim_drivers.invoke(driver_type,
+                                     'remove_and_delete_flow_classifiers',
                                      chain_id=sfc['instance_id'],
-                                     auth_attr=vim_obj['auth_cred'],
-                                     symmetrical=new_vnffg['symmetrical'])
+                                     fc_ids=classifier_delete_ids,
+                                     auth_attr=vim_obj['auth_cred'])
+            for item in classifier_update:
+                fc_ids.append(self._vim_drivers.invoke(driver_type,
+                                         'update_flow_classifier',
+                                         chain_id=sfc['instance_id'],
+                                         fc=item,
+                                         auth_attr=vim_obj['auth_cred']))
+            n_sfc_chain_id = self._vim_drivers.invoke(
+                driver_type, 'update_chain',
+                vnfs=sfc['chain'], fc_ids=fc_ids,
+                chain_id=sfc['instance_id'], auth_attr=vim_obj['auth_cred'])
         except Exception:
             with excutils.save_and_reraise_exception():
-                vnffg_dict['status'] = constants.ERROR
-                super(NfvoPlugin, self)._update_vnffg_post(context, vnffg_id,
-                                                           constants.ERROR)
-        super(NfvoPlugin, self)._update_vnffg_post(context, vnffg_id,
-                                                   constants.ACTIVE, new_vnffg)
-        # update chain
-        super(NfvoPlugin, self)._update_sfc_post(context, sfc['id'],
-                                                 constants.ACTIVE, sfc)
-        # update classifier - this is just updating status until functional
-        # updates are supported to classifier
-        super(NfvoPlugin, self)._update_classifier_post(context,
-                                                        nfp['classifier_ids'],
-                                                        constants.ACTIVE)
+                super(NfvoPlugin, self)._update_vnffg_status_post(context,
+                                                             vnffg_dict,
+                                                             error=True)
+
+        classifiers_map = super(NfvoPlugin, self).create_classifiers_map(
+            classifier_ids, fc_ids)
+        super(NfvoPlugin, self)._update_vnffg_post(context, n_sfc_chain_id,
+                                                   classifiers_map,
+                                                   vnffg_dict)
+        super(NfvoPlugin, self)._update_vnffg_status_post(context, vnffg_dict)
         return vnffg_dict
 
     @log.log
@@ -490,7 +518,7 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
         return vim_obj
 
     def _build_vim_auth(self, context, vim_info):
-        LOG.debug('VIM id is %s', vim_info['id'])
+        LOG.debug('VIM ID is %s', vim_info['id'])
         vim_auth = vim_info['auth_cred']
         vim_auth['password'] = self._decode_vim_auth(context,
                                                      vim_info['id'],
@@ -703,7 +731,7 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
                 if req_val in nsd_dict['topology_template']['node_templates']:
                     param_values[vnfd_name]['substitution_mappings'][
                         res_name] = nsd_dict['topology_template'][
-                            'node_templates'][req_val]
+                        'node_templates'][req_val]
 
             param_values[vnfd_name]['substitution_mappings'][
                 'requirements'] = req_dict
@@ -806,17 +834,19 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
     def delete_ns(self, context, ns_id):
         ns = super(NfvoPlugin, self).get_ns(context, ns_id)
         vim_res = self.vim_client.get_vim(context, ns['vim_id'])
+        super(NfvoPlugin, self).delete_ns_pre(context, ns_id)
         driver_type = vim_res['vim_type']
         workflow = None
         try:
-            workflow = self._vim_drivers.invoke(
-                driver_type,
-                'prepare_and_create_workflow',
-                resource='vnf',
-                action='delete',
-                auth_dict=self.get_auth_dict(context),
-                kwargs={
-                    'ns': ns})
+            if ns['vnf_ids']:
+                workflow = self._vim_drivers.invoke(
+                    driver_type,
+                    'prepare_and_create_workflow',
+                    resource='vnf',
+                    action='delete',
+                    auth_dict=self.get_auth_dict(context),
+                    kwargs={
+                        'ns': ns})
         except nfvo.NoTasksException:
             LOG.warning("No VNF deletion task(s).")
         if workflow:
@@ -835,7 +865,6 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
                                          auth_dict=self.get_auth_dict(context))
 
                 raise ex
-        super(NfvoPlugin, self).delete_ns(context, ns_id)
 
         def _delete_ns_wait(ns_id, execution_id):
             exec_state = "RUNNING"
@@ -874,6 +903,7 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
                                      auth_dict=self.get_auth_dict(context))
             super(NfvoPlugin, self).delete_ns_post(context, ns_id, exec_obj,
                                                    error_reason)
+
         if workflow:
             self.spawn_n(_delete_ns_wait, ns['id'], mistral_execution.id)
         else:
@@ -884,84 +914,119 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
     @log.log
     def create_cluster(self, context, cluster, reconfig=None):
         # 1. Create Cluster
-        cluster_config = cluster['cluster']
-        policy_info = cluster_config['policy_info']
+        cluster_config = cluster.get('cluster')
+        policy_info = cluster_config.get('policy_info')
 
         if reconfig is None:
-            cluster_dict = self._create_cluster_db(context, cluster_config)
             role_config = policy_info['properties']['role']
-            vim_names = self.get_required_vims(context, role_config)
-            cluster_dict['lb_info'] = {}
+            vim_list = self.get_required_vims(context, role_config)
+            cluster_dict = self._create_cluster_db(context, cluster_config)
+            cluster_dict['lb_info'] = dict()
+            cluster_dict['vip_endpoint'] = dict()
         else:
-            role_config = reconfig['role_config']
-            vim_names = reconfig['vim_name']
-            cluster_dict = reconfig['cluster_dict']
+            role_config = reconfig.get('role_config')
+            vim_list = reconfig.get('vim_name')
+            cluster_dict = reconfig.get('cluster_dict')
 
         # Get cluster_id from deployed cluster
-        cluster_id = cluster_dict['id']
+        cluster_id = cluster_dict.get('id')
 
         # Muliple VIM name scenario processing
-        if len(vim_names) > 1:
-            for vim in vim_names:
-                role_by_vim = self.get_role_by_vim(role_config, vim)
+        if len(vim_list) > 1:
+            # Multiple VIMs are specified in role_config
+            for vim_name in vim_list:
+                role_by_vim = \
+                    self.get_role_by_vim(context, role_config, vim_name)
                 if len(role_by_vim) > 0:
-                    reconfig = {}
-                    reconfig['vim_name'] = [vim]
-                    reconfig['role_config'] = role_by_vim
-                    reconfig['cluster_dict'] = cluster_dict
-                    cluser_result = \
+                    reconfig = dict(vim_name=[vim_name],
+                                    role_config=role_by_vim,
+                                    cluster_dict=cluster_dict)
+                    cluster_result = \
                         self.create_cluster(context, cluster,
                                             reconfig=reconfig)
+                    if cluster_result is None:
+                        self._update_cluster_attr(context, cluster_id,
+                                                  'status', constants.ERROR)
+                        raise vnfcluster.\
+                            ClusterCreateFailed(cluster_id=cluster_id)
+            return cluster_result
 
-            if cluser_result is not None:
-                return cluser_result
-        elif len(vim_names) == 1:
-            vim_names = vim_names[0]
-            vim_dict = self.get_vim_by_name(context, vim_names)
-        else:
-            # There is no VIM name is specified.
-            # Get default VIM
-            LOG.error('There is no VIM is specified')
+        elif len(vim_list) == 1:
+            # Single VIM is specified in role_config
+            vim_name = vim_list[0]
+            vim_obj = self.get_vim_by_name(context, vim_name)
+            vim_id = vim_obj.get('id')
+            role_config = self.get_role_by_vim(context, role_config, vim_name)
+            if role_config is None:
+                self._update_cluster_attr(context, cluster_id,
+                                          'status', constants.ERROR)
+                raise vnfcluster.ClusterRoleConfigInvalid()
 
         # 2. Deploy Neutron Load-balancer for created cluster members
         lb_pool = self.get_lb_config(policy_info, 'pool')
         lb_vip = self.get_lb_config(policy_info, 'vip')
-        lb_info = self._vim_drivers.invoke(vim_dict['type'],
+        lb_listener = self.get_lb_config(policy_info, 'listener')
+        invalid_config = None
+        if lb_vip is None:
+            invalid_config = 'load_balancer:vip'
+        elif lb_pool is None:
+            invalid_config = 'load_balancer:pool'
+        elif lb_listener is None:
+            invalid_config = 'load_balancer:listener'
+        if invalid_config is not None:
+            self._update_cluster_attr(context, cluster_id,
+                                      'status', constants.ERROR)
+            raise vnfcluster.InvalidLoadBalancerConfig(config=invalid_config)
+
+        lb_info = self._vim_drivers.invoke(vim_obj['type'],
                                            'create_loadbalancer',
                                            lb_pool=lb_pool,
                                            lb_vip=lb_vip,
-                                           auth_attr=vim_dict['auth_cred'])
+                                           lb_listener=lb_listener,
+                                           auth_attr=vim_obj['auth_cred'])
         if lb_info is None:
-            LOG.error("Load balancer is not ready")
+            LOG.error('Creating Load balancer failed.')
             cluster_dict['status'] = self._update_cluster_attr(context,
                                                                cluster_id,
                                                                'status',
                                                                constants.ERROR)
-            return cluster_dict
+            raise vnfcluster.LoadBalancerCreateFailed()
 
-        cluster_dict['lb_info'][vim_names] = lb_info
+        # Update lb_info
+        cluster_dict['lb_info'][vim_name] = lb_info
         cluster_dict['lb_info']['CP'] = \
-            policy_info['properties']['load_balancer']['target']
+            self.get_lb_config(policy_info, 'target')
+        self._update_cluster_attr(context, cluster_id,
+                                  'lb_info', cluster_dict['lb_info'])
 
-        self._update_cluster_attr(context,
-                                  cluster_id,
-                                  'lb_info',
-                                  cluster_dict['lb_info'])
+        # Update vip_endpoint
+        vip_endpoint = {lb_info.get('vip_address'):
+                        lb_info.get('protocol_port')}
+        if reconfig is None:
+            cluster_dict['vip_endpoint'] = vip_endpoint
+        else:
+            cluster_dict['vip_endpoint'][vim_name] = vip_endpoint
+        self._update_cluster_attr(context, cluster_id,
+                                  'vip_endpoint', cluster_dict['vip_endpoint'])
 
         # 3. Create cluster member by role
         for role in role_config:
-            n_members = (role_config[role])[vim_names]
-            for i in xrange(n_members):
-                member_name = role.upper() + '-' + uuidutils.generate_uuid()
-                member_config = \
-                    self._make_member_config(member_name, role, cluster_id,
-                                             cluster_dict['vnfd_id'],
-                                             vim_names)
-                self.create_clustermember(context, member_config)
+            n_members = role_config[role].get(vim_name)
+            role = role.upper()
+            if n_members > 0:
+                for i in xrange(n_members):
+                    member_name = role + '-' + uuidutils.generate_uuid()
+                    member_config = \
+                        self._make_member_config(member_name, role, cluster_id,
+                                                 cluster_dict['vnfd_id'],
+                                                 vim_id)
+                    self.create_clustermember(context, member_config)
 
-        cluster_dict['status'] = self._update_cluster_attr(context, cluster_id,
-                                                           'status',
-                                                           constants.ACTIVE)
+        cluster_dict['role_config'] = \
+            self._get_cluster_db(context, cluster_id).get('role_config')
+        cluster_dict['status'] = \
+            self._update_cluster_attr(context, cluster_id,
+                                      'status', constants.ACTIVE)
         return cluster_dict
 
     @log.log
@@ -970,44 +1035,47 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
         LOG.warning(("Handling recovery_action for the fault vnf_id : %s"),
                     fault_vnf_id)
         fault_member_dict = \
-            self._get_member_by_vnf_id(context, fault_vnf_id)
-        fault_member_id = fault_member_dict['id']
+            self.get_member_by_attr(context, dict(vnf_id=[fault_vnf_id]))
+        fault_member_id = fault_member_dict.get('id')
 
-        cluster_id = fault_member_dict['cluster_id']
+        cluster_id = fault_member_dict.get('cluster_id')
         cluster_dict = self.get_cluster(context, cluster_id)
-        LOG.debug(("Recovery_action on vnfcluster : %s"), cluster_dict)
+        self._update_cluster_attr(context, cluster_id,
+                                  'status', constants.PENDING_UPDATE)
 
         # Get vim_obj
-        vim_name = fault_member_dict['placement_attr']
-        vim_obj = self.get_vim_by_name(context, vim_name)
+        vim_id = fault_member_dict.get('vim_id')
+        vim_obj = self.get_vim(context, vim_id, mask_password=False)
+        self._build_vim_auth(context, vim_obj)
+        vim_name = vim_obj.get('name')
 
-        role_config = \
-            self.get_role_by_vim(cluster_dict['role_config'], vim_name)
         lb_info = cluster_dict['lb_info'].get(vim_name)
 
-        fault_member_role = fault_member_dict['role']
+        role_config = cluster_dict.get('role_config')
+        fault_member_role = fault_member_dict.get('role')
         if fault_member_role == constants.CLUSTER_ACTIVE:
-            n_standby = role_config.get('standby')
-            if n_standby > 0:
-                # 1a. Update STANDBY member to ACTIVE member,
+            n_standby = 0
+            if constants.CLUSTER_STANDBY in role_config:
+                standby_list = \
+                    role_config[constants.CLUSTER_STANDBY].get(vim_name)
+                if standby_list is not None:
+                    n_standby = len(standby_list)
+
+            if n_standby == 0:
+                # 1a. Pointing out that a new member will be ACTIVE member
+                new_member_role = constants.CLUSTER_ACTIVE
+
+            elif n_standby > 0:
+                # 1b. Update STANDBY member to ACTIVE member,
                 # and a new member will be STANDBY member
-                alter_member = \
-                    self._get_member_by_role(context, cluster_id,
-                                             constants.CLUSTER_STANDBY,
-                                             vim_name)
+                filters = dict(cluster_id=[cluster_id],
+                               role=[constants.CLUSTER_STANDBY],
+                               vim_id=[vim_id])
+                alter_member = self.get_member_by_attr(context, filters)
                 self.update_member_role(context, vim_obj, lb_info,
                                         alter_member,
                                         constants.CLUSTER_ACTIVE)
-
                 new_member_role = constants.CLUSTER_STANDBY
-
-            elif n_standby == 0 or n_standby is None:
-                # 1b. Pointing out that a new member will be ACTIVE member
-                new_member_role = constants.CLUSTER_ACTIVE
-
-            else:
-                LOG.error('Invalid configuration for role %s',
-                          constants.CLUSTER_STANDBY)
 
         elif fault_member_role == constants.CLUSTER_STANDBY:
             # 1c. In the case of STANDBY member down,
@@ -1021,7 +1089,7 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
                                                  new_member_role,
                                                  cluster_id,
                                                  cluster_dict['vnfd_id'],
-                                                 vim_name)
+                                                 vim_id)
         new_member = self.create_clustermember(context, member_config)
         LOG.debug('Recovery with a new member: %s', new_member['id'])
 
@@ -1029,6 +1097,9 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
         self.delete_clustermember(context, fault_member_id)
         LOG.debug('Remove the failure member %s from deployed cluster',
                   fault_member_id)
+        self._update_cluster_attr(context, cluster_id,
+                                  'status', constants.ACTIVE)
+        LOG.warning("Recovery action has finished.")
 
     @log.log
     def get_cluster(self, context, cluster_id, fields=None):
@@ -1041,36 +1112,35 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
     @log.log
     def delete_cluster(self, context, cluster_id):
         cluster_dict = self.get_cluster(context, cluster_id)
+        status = cluster_dict['status']
+        if status == constants.PENDING_UPDATE:
+            raise vnfcluster.ClusterInUse(cluster_id=cluster_id)
         # Delete member from cluster
-        try:
-            cluster_dict['status'] = \
-                self._update_cluster_attr(context, cluster_id, 'status',
-                                          constants.PENDING_DELETE)
-            member_list = self.get_clustermembers(context)
-            for mem in member_list:
-                if mem['cluster_id'] == cluster_id:
-                    self.delete_clustermember(context, mem['id'])
-        except Exception:
-            LOG.warning('There is not any attached member in cluster %s',
-                      cluster_dict['id'])
+        self._update_cluster_attr(context, cluster_id, 'status',
+                                  constants.PENDING_DELETE)
+
+        member_list = self.get_clustermembers(context,
+                                              dict(cluster_id=[cluster_id]))
+        for mem in member_list:
+            self.delete_clustermember(context, mem['id'])
 
         lb_info = cluster_dict['lb_info']
         # Delete load balancer
-        if lb_info is not None:
+        try:
             for vim in lb_info:
                 if vim == 'CP':
                     continue
-                lb_by_vim = cluster_dict['lb_info'][vim]
-                try:
-                    vim_dict = self.get_vim_by_name(context, vim)
-                    self._vim_drivers.invoke(vim_dict['type'],
-                                             'delete_loadbalancer',
-                                             lb_id=lb_by_vim['loadbalancer'],
-                                             lb_pool=lb_by_vim['pool'],
-                                             lb_listener=lb_by_vim['listener'],
-                                             auth_attr=vim_dict['auth_cred'])
-                except Exception:
-                    LOG.debug('Load balancer resouces could not be found')
+                lb_by_vim = cluster_dict['lb_info'].get(vim)
+                vim_dict = self.get_vim_by_name(context, vim)
+                self._vim_drivers.invoke(vim_dict['type'],
+                                         'delete_loadbalancer',
+                                         lb_id=lb_by_vim['lb_id'],
+                                         pool_id=lb_by_vim['pool_id'],
+                                         listener_id=lb_by_vim['listener_id'],
+                                         auth_attr=vim_dict['auth_cred'])
+        except Exception:
+            LOG.warning('Load balancer resources could not be found')
+
         self._delete_cluster_db(context, cluster_id)
 
     @log.log
@@ -1082,54 +1152,70 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
         name = param_dict['name']
         role = param_dict['role']
         cluster_id = param_dict['cluster_id']
-        vim_name = param_dict['placement_attr']
+        vim_id = param_dict['vim_id']
+
+        roles = [constants.CLUSTER_ACTIVE, constants.CLUSTER_STANDBY]
+        if role not in roles:
+            raise vnfcluster.ClusterMemberRoleInvalid(role=role)
 
         cluster_dict = self.get_cluster(context, cluster_id)
-        vim_obj = self.get_vim_by_name(context, vim_name)
 
-        # Check cluster deployment status
+        if vim_id is '':
+            vim_obj = self.get_default_vim(context)
+        else:
+            vim_obj = self.get_vim(context, vim_id, mask_password=False)
+        self._build_vim_auth(context, vim_obj)
+        vim_name = vim_obj['name']
+
+        # Check and update cluster status
         if cluster_dict['status'] == constants.ACTIVE:
             cluster_dict['status'] = \
                 self._update_cluster_attr(context, cluster_id,
                                           'status', constants.PENDING_UPDATE)
-            # Update role_config in deployed cluster
-            role_config = cluster_dict['role_config']
-            n_member = role_config[role.lower()][vim_name]
-            if n_member is None:
-                n = 1
-            else:
-                n = int(n_member) + 1
-            role_config[role.lower()][vim_name] = n
-            self._update_cluster_attr(context, cluster_id,
-                                      'role_config', role_config)
 
         member_dict = self._create_cluster_member(context, vnfm_plugin,
                                                   cluster_dict,
-                                                  name, role, vim_name)
+                                                  name, role, vim_id)
+        # Update role_config in cluster
+        role_config = cluster_dict['role_config']
+        if role_config.get(role) is None:
+            role_config[role] = dict()
+        if role_config[role].get(vim_name) is None:
+            role_config[role][vim_name] = dict()
+        role_config[role][vim_name][member_dict['id']] = member_dict['vnf_id']
+        self._update_cluster_attr(context, cluster_id,
+                                  'role_config', role_config)
 
         # Attach ACTIVE cluster member in deployed load balancer
-        if role.upper() == constants.CLUSTER_ACTIVE:
-            try:
-                lb_obj = cluster_dict['lb_info'].get(vim_name)
-                cp_id = self._get_member_cp_id(context, vnfm_plugin,
-                                             cluster_dict,
-                                             member_dict['vnf_id'])
-                lb_member_id = \
-                    self._vim_drivers.invoke(vim_obj['type'],
-                                             'pool_member_add',
-                                             net_port_id=cp_id,
-                                             lb_info=lb_obj,
-                                             auth_attr=vim_obj['auth_cred'])
-                LOG.debug(("create lb_member_result : %s"), lb_member_id)
-                self._update_member_attr(context,
-                                         member_dict['id'],
-                                         'lb_member_id',
-                                         lb_member_id)
-            except Exception:
-                LOG.error('Load balancer resource '
-                          'could not be found in %s', vim_name)
-                LOG.error('Member %ds could not be attach on '
-                          'load balancer', member_dict['id'])
+        if role == constants.CLUSTER_ACTIVE:
+            lb_obj = cluster_dict['lb_info'].get(vim_name)
+            if lb_obj is None:
+                raise vnfcluster.LoadBalancerResourceNotFound(vim=vim_name)
+            cp_id = self._get_member_cp_id(context, vnfm_plugin,
+                                           cluster_dict,
+                                           member_dict['vnf_id'])
+            if cp_id is None:
+                self._update_cluster_attr(context, cluster_id,
+                                          'status', constants.ERROR)
+                raise vnfcluster.ClusterMemberCPNotFound()
+
+            lb_member_id = \
+                self._vim_drivers.invoke(vim_obj['type'],
+                                         'pool_member_add',
+                                         net_port_id=cp_id,
+                                         lb_info=lb_obj,
+                                         auth_attr=vim_obj['auth_cred'])
+            if lb_member_id is None:
+                self._update_cluster_attr(context, cluster_id,
+                                          'status', constants.ERROR)
+                raise vnfcluster.\
+                    ClusterMemberAddFailed(clustermember_id=member_dict['id'])
+
+            LOG.debug(("create lb_member_result : %s"), lb_member_id)
+            self._update_member_attr(context,
+                                     member_dict['id'],
+                                     'lb_member_id',
+                                     lb_member_id)
 
         if cluster_dict['status'] is constants.PENDING_UPDATE:
             cluster_dict['status'] = \
@@ -1140,7 +1226,7 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
     @log.log
     def get_clustermember(self, context, clustermember_id,
                           filters=None, fields=None):
-        return self._get_member_db(context, clustermember_id)
+        return self._get_member_db(context, clustermember_id, fields)
 
     @log.log
     def get_clustermembers(self, context, filters=None, fields=None):
@@ -1151,46 +1237,53 @@ class NfvoPlugin(nfvo_db_plugin.NfvoPluginDb, vnffg_db.VnffgPluginDbMixin,
 
         vnfm_plugin = manager.TackerManager.get_service_plugins()['VNFM']
         member_id = cluster_member_id
-        member = self.get_clustermember(context, member_id)
-        role = member['role']
-        LOG.debug('The deleted member has %s role', role)
+        try:
+            member = self.get_clustermember(context, member_id)
+        except Exception:
+            LOG.error('Cannot get resources from cluster member %s', member_id)
+            raise vnfcluster.ClusterMemberNotFound(clustermember_id=member_id)
 
-        vim_name = member['placement_attr']
-        vim_obj = self.get_vim_by_name(context, vim_name)
+        role = member.get('role')
+
+        vim_id = member.get('vim_id')
+        vim_obj = self.get_vim(context, vim_id, mask_password=False)
+        self._build_vim_auth(context, vim_obj)
+        vim_name = vim_obj.get('name')
 
         # Check cluster deployment status
-        cluster_id = member['cluster_id']
+        cluster_id = member.get('cluster_id')
         cluster_dict = self.get_cluster(context, cluster_id)
         if cluster_dict['status'] == constants.ACTIVE:
             cluster_dict['status'] = \
                 self._update_cluster_attr(context, cluster_id,
                                           'status', constants.PENDING_UPDATE)
-            # Update role_config in deployed cluster
-            role_config = cluster_dict['role_config']
-            n_member = role_config[role.lower()][vim_name]
-
-            role_config[role.lower()][vim_name] = int(n_member) - 1
-            self._update_cluster_attr(context, cluster_id,
-                                      'role_config',
-                                      role_config)
 
         if role == constants.CLUSTER_ACTIVE:
             try:
                 lb_member_id = member['lb_member_id']
                 cluster_id = member['cluster_id']
-                lb_info = \
-                    self.get_cluster(context,
-                                     cluster_id,
-                                     'lb_info')['lb_info'][vim_name]
+                lb_info = self.get_cluster(context, cluster_id,
+                                           'lb_info')['lb_info'][vim_name]
                 LOG.debug('Get load balancer information: %s', lb_info)
                 self._vim_drivers.invoke(vim_obj['type'],
                                          'pool_member_remove',
-                                         lb_id=lb_info['loadbalancer'],
-                                         pool_id=lb_info['pool'],
+                                         lb_id=lb_info['lb_id'],
+                                         pool_id=lb_info['pool_id'],
                                          member_id=lb_member_id,
                                          auth_attr=vim_obj['auth_cred'])
             except Exception:
-                LOG.error('Load balancer resource could not be found')
+                LOG.error('Load balancer resources could not be found.')
+
+        # Update role_config in cluster
+        role_config = cluster_dict.get('role_config')
+        try:
+            LOG.debug('Delete member %s from cluster %s',
+                      member_id, cluster_id)
+            del role_config[role][vim_name][member_id]
+            self._update_cluster_attr(context, cluster_id,
+                                      'role_config', role_config)
+        except Exception:
+            LOG.warning('Invalid cluster role configuration.')
 
         self._delete_member_db(context, member_id)
         vnfm_plugin.delete_vnf(context, member['vnf_id'])
