@@ -12,11 +12,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import yaml
 from oslo_config import cfg
+import yaml
 
-from tacker.plugins.common import constants as evt_constants
-from tacker.tests import constants
+
 from tacker.tests.functional import base
 from tacker.tests.utils import read_file
 
@@ -40,14 +39,10 @@ class ClusterTestCreate(base.BaseTackerTest):
         # Create a cluster with vnfd_id and policy file
         cluster_name = 'cluster-test'
         vnfd_id = vnfd_instance['vnfd']['id']
-        policy_info = yaml.safe_load(read_file('sample-cluster-policy'))
+        policy_info = yaml.safe_load(read_file('sample-cluster-policy.yaml'))
         cluster_arg = {'cluster': {'policy_info': policy_info,
                                    'name': cluster_name,
                                    'vnfd_id': vnfd_id}}
 
         cluster_instance = self.client.create_cluster(body=cluster_arg)
         self.assertIsNone(cluster_instance)
-
-
-
-
