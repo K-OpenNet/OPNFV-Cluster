@@ -255,14 +255,19 @@ class NSPluginDb(network_service.NSPluginBase, db_base.CommonDbMixin):
         vim_id = ns['vim_id']
         name = ns.get('name')
         ns_id = uuidutils.generate_uuid()
+        description = None
+        if 'description' in ns:
+            description = ns.get('description')
         try:
             with context.session.begin(subtransactions=True):
-                nsd_db = self._get_resource(context, NSD,
-                                            nsd_id)
+                if description is None:
+                    nsd_db = self._get_resource(context, NSD,
+                                                nsd_id)
+                    description = nsd_db.description
                 ns_db = NS(id=ns_id,
                            tenant_id=tenant_id,
                            name=name,
-                           description=nsd_db.description,
+                           description=description,
                            vnf_ids=None,
                            status=constants.PENDING_CREATE,
                            mgmt_urls=None,
@@ -325,7 +330,7 @@ class NSPluginDb(network_service.NSPluginBase, db_base.CommonDbMixin):
         return ns_dict
 
     # reference implementation. needs to be overrided by subclass
-    def delete_ns(self, context, ns_id):
+    def delete_ns_pre(self, context, ns_id):
         with context.session.begin(subtransactions=True):
             ns_db = self._get_ns_db(
                 context, ns_id, _ACTIVE_UPDATE_ERROR_DEAD,

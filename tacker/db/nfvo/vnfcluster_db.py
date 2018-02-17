@@ -13,11 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_log import log as logging
-from oslo_utils import uuidutils
+import sqlalchemy as sa
 import time
 
-import sqlalchemy as sa
+from oslo_log import log as logging
+from oslo_utils import uuidutils
 from sqlalchemy import orm
 from sqlalchemy.orm import exc as orm_exc
 
@@ -38,9 +38,10 @@ class VnfCluster(model_base.BASE, models_v1.HasId, models_v1.HasTenant):
 
     __tablename__ = 'clusters'
     __table_args__ = {'extend_existing': True}
-    name = sa.Column(sa.String(255), nullable=True)
+    name = sa.Column(sa.String(255), nullable=False)
     description = sa.Column(sa.String(255), nullable=True)
     status = sa.Column(sa.String(255), nullable=False)
+    vip_endpoint = sa.Column(types.Json, nullable=True)
     vnfd_id = sa.Column(sa.String(255), sa.ForeignKey('vnfd.id'))
     lb_info = sa.Column(types.Json, nullable=True)
     cluster_members = orm.relationship("VnfClusterMember",
@@ -53,12 +54,12 @@ class VnfClusterMember(model_base.BASE, models_v1.HasId, models_v1.HasTenant):
 
     __tablename__ = 'clustermembers'
     __table_args__ = {'extend_existing': True}
-    name = sa.Column(sa.String(255), nullable=True)
+    name = sa.Column(sa.String(255), nullable=False)
     cluster_id = sa.Column(sa.String(255), sa.ForeignKey('clusters.id'))
     vnf_id = sa.Column(sa.String(255), sa.ForeignKey('vnf.id'))
     role = sa.Column(sa.String(255), nullable=False)
-    mgmt_url = sa.Column(sa.String(255), nullable=False)
-    placement_attr = sa.Column(sa.String(255), nullable=True)
+    mgmt_url = sa.Column(sa.String(255), nullable=True)
+    vim_id = sa.Column(sa.String(255))
     lb_member_id = sa.Column(sa.String(255), nullable=True)
 
 
@@ -74,15 +75,15 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
             return self._get_by_id(context, model, id)
         except orm_exc.NoResultFound:
             if issubclass(model, VnfCluster):
-                raise vnfcluster.VnfClusterNotFound(cluster_id=id)
+                raise vnfcluster.ClusterNotFound(cluster_id=id)
             if issubclass(model, VnfClusterMember):
-                raise vnfcluster.VnfClusterMemberNotFound(cluster_member_id=id)
+                raise vnfcluster.ClusterMemberNotFound(clustermember_id=id)
             else:
                 raise
 
     def _create_cluster_db(self, context, cluster_config):
         cluster_dict = self._create_cluster_pre(context, cluster_config)
-        LOG.debug(('cluster_dict %s'), cluster_dict)
+        LOG.debug('cluster_dict %s', cluster_dict)
         return cluster_dict
 
     def _get_cluster_db(self, context, cluster_id, fields=None):
@@ -109,7 +110,7 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
         name = cluster_config['name']
         description = cluster_config['description']
         vnfd_id = cluster_config['vnfd_id']
-        role_config = cluster_config['policy_info']['properties']['role']
+        role_config = dict()
 
         with context.session.begin(subtransactions=True):
             cluster_db = VnfCluster(id=cluster_id,
@@ -118,16 +119,17 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
                                     description=description,
                                     status=constants.PENDING_CREATE,
                                     vnfd_id=vnfd_id,
-                                    role_config=role_config)
+                                    role_config=role_config,
+                                    vip_endpoint=None)
             context.session.add(cluster_db)
         cluster_dict = self._make_cluster_dict(cluster_db)
         return cluster_dict
 
     def _make_cluster_dict(self, cluster_db, fields=None):
-        res = {}
+        res = dict()
         key_list = ('id', 'tenant_id', 'name', 'description',
                     'status', 'vnfd_id',
-                    'lb_info', 'role_config')
+                    'lb_info', 'role_config', 'vip_endpoint')
         res.update((key, cluster_db[key]) for key in key_list)
         return self._fields(res, fields)
 
@@ -139,76 +141,102 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
         return attr
 
     def get_lb_config(self, policy_info, attr_key):
-        attr_dict = policy_info['properties']['load_balancer'][attr_key]
+        try:
+            attr_dict = policy_info['properties']['load_balancer'][attr_key]
+        except Exception:
+            return None
         return attr_dict
 
-    def get_role_by_vim(self, role_config, vim_name):
-        filted_role = {}
-        for role, role_attr in role_config.iteritems():
-            n_node = 0
-            for vim, n in role_attr.iteritems():
-                if vim == vim_name:
-                    n_node += n
-            if n_node != 0:
-                filted_role[role] = n_node
+    def get_role_by_vim(self, context, role_config, vim_name):
+        role_by_vim = dict()
+        try:
+            for role, role_attr in role_config.iteritems():
+                cluster_roles = [constants.CLUSTER_STANDBY,
+                                 constants.CLUSTER_ACTIVE]
+                if role.upper() not in cluster_roles:
+                    return None
+                n_node = 0
+                if type(role_attr) is int:
+                    # Get role_config in form: "role: number_of_nodes"
+                    # Default VIM will be invoked
+                    vim = self.get_vim_by_name(context, None).get('name')
+                    if vim == vim_name:
+                        n_node += role_attr
+                else:
+                    for vim, n in role_attr.iteritems():
+                        if vim == vim_name:
+                            n_node += n
+                if n_node != 0:
+                    if role not in role_by_vim:
+                        role_by_vim[role] = dict()
+                    role_by_vim[role][vim_name] = n_node
+        except Exception:
+            return None
 
-        return filted_role
+        return role_by_vim
 
-    def get_required_vims(self, context, role_config):
-        default_vim = self.get_vim_by_name(context, None).get('name')
-        vim_list = []
-        for role, role_attr in role_config.iteritems():
-            if type(role_attr) is int:
-                if None not in vim_list:
-                    vim_list.append(default_vim)
-            else:
-                for vim_name, n in role_attr.iteritems():
-                    if n > 0 and vim_name not in vim_list:
-                        vim_list.append(vim_name)
-        return vim_list
+    def get_required_vims(self, context, role_config=None):
+        vim_list = set()
+        try:
+            for role, role_attr in role_config.iteritems():
+                if type(role_attr) is int:
+                    # Get role_config in form: "role: number_of_nodes"
+                    # Default VIM will be invoked
+                    default_vim = \
+                        self.get_vim_by_name(context, None).get('name')
+                    vim_list.add(default_vim)
+                else:
+                    for vim_name, n in role_attr.iteritems():
+                        if n > 0 and vim_name not in vim_list:
+                            vim_list.add(vim_name)
+        except Exception:
+            LOG.error('VIM is not declared in policy file')
+            raise vnfcluster.ClusterRoleConfigInvalid()
+        return list(vim_list)
 
     def _create_cluster_member(self, context, vnfm_plugin,
-                               cluster_dict, name, role, vim_name):
+                               cluster_dict, name, role, vim_id):
         vnf_member = self._create_vnf_member(context, vnfm_plugin,
-                                             cluster_dict, name, vim_name)
+                                             cluster_dict, name, vim_id)
         member_dict = self._make_member_dict_from_vnf(cluster_dict['id'],
                                                       role, vnf_member)
         self._create_member(context, member_dict)
         return member_dict
 
     def _create_vnf_member(self, context, vnfm_plugin,
-                           cluster, name, vim_name):
-        vim_dict = self.get_vim_by_name(context, vim_name)
-        pre_vnf_dict = self._make_pre_vnf_dict(cluster, name, vim_dict['id'])
+                           cluster, name, vim_id):
+        pre_vnf_dict = self._make_pre_vnf_dict(cluster, name, vim_id)
         vnf_dict = vnfm_plugin.create_vnf(context, pre_vnf_dict)
+        LOG.debug('Creating %s', vnf_dict.get('name'))
         while (1):
-            LOG.debug(("Creating %s ..."), vnf_dict.get('name'))
-            if vnf_dict.get('status') == 'ACTIVE':
+            status = vnf_dict.get('status')
+            if status == constants.ACTIVE:
+                return vnf_dict
+            elif status == constants.ERROR or status == constants.DEAD:
                 break
             time.sleep(2)
-        return vnf_dict
+        # Delete VNF if the deployment fail.
+        vnfm_plugin.delete_vnf(context, vnf_dict.get('id'))
+        raise vnfcluster.ClusterMemberCreateFailed(vnf_id=vnf_dict.get('id'))
 
-    def _make_member_config(self, name, role, cluster_id, vnfd_id, vim_name):
-        config = {}
-        config['name'] = name
-        config['role'] = role
-        config['cluster_id'] = cluster_id
-        config['placement_attr'] = vim_name
-        config['vnfd_id'] = vnfd_id
-        member_config = {'clustermember': config}
+    def _make_member_config(self, name, role, cluster_id, vnfd_id, vim_id):
+        config = dict(name=name,
+                      role=role,
+                      cluster_id=cluster_id,
+                      vim_id=vim_id,
+                      vnfd_id=vnfd_id)
+        member_config = dict(clustermember=config)
         return member_config
 
     def _make_pre_vnf_dict(self, cluster, name, vim_id):
-        vnf_dict = {}
-        p = {}
-        p['description'] = 'A member of cluster ' + cluster['name']
-        p['tenant_id'] = cluster['tenant_id']
-        p['vim_id'] = vim_id
-        p['name'] = name
-        p['placement_attr'] = {}
-        p['attributes'] = {}
-        p['vnfd_id'] = cluster['vnfd_id']
-        vnf_dict['vnf'] = p
+        p = dict(description='A member of cluster ' + cluster['name'],
+                 tenant_id=cluster['tenant_id'],
+                 vim_id=vim_id,
+                 name=name,
+                 placement_attr=dict(),
+                 attributes=dict(),
+                 vnfd_id=cluster['vnfd_id'])
+        vnf_dict = dict(vnf=p)
         LOG.debug(("_make_policy_dict p : %s"), p)
         return vnf_dict
 
@@ -228,9 +256,9 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
             context.session.delete(member_db)
 
     def _make_member_dict(self, member_db, fields=None):
-        res = {}
+        res = dict()
         key_list = ('id', 'tenant_id', 'name', 'cluster_id', 'role',
-                    'placement_attr', 'lb_member_id', 'vnf_id', 'mgmt_url')
+                    'vim_id', 'lb_member_id', 'vnf_id', 'mgmt_url')
         res.update((key, member_db[key]) for key in key_list)
         return self._fields(res, fields)
 
@@ -242,13 +270,13 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
         role = member['role']
         vnf_id = member['vnf_id']
         mgmt_url = member['mgmt_url']
-        placement_attr = member['placement_attr']
+        vim_id = member['vim_id']
         with context.session.begin(subtransactions=True):
             member_db = VnfClusterMember(id=member_id,
                                          tenant_id=tenant_id,
                                          name=member_name,
                                          cluster_id=cluster_id,
-                                         placement_attr=placement_attr,
+                                         vim_id=vim_id,
                                          role=role,
                                          vnf_id=vnf_id,
                                          mgmt_url=mgmt_url)
@@ -259,15 +287,14 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
         return member_dict
 
     def _make_member_dict_from_vnf(self, cluster_id, role, vnf_info):
-        member_dict = {}
-        member_dict['id'] = uuidutils.generate_uuid()
-        member_dict['tenant_id'] = vnf_info['tenant_id']
-        member_dict['name'] = vnf_info['name']
-        member_dict['cluster_id'] = cluster_id
-        member_dict['role'] = role.upper()
-        member_dict['placement_attr'] = vnf_info['placement_attr']['vim_name']
-        member_dict['vnf_id'] = vnf_info['id']
-        member_dict['mgmt_url'] = vnf_info['mgmt_url']
+        member_dict = dict(id=uuidutils.generate_uuid(),
+                           tenant_id=vnf_info['tenant_id'],
+                           name=vnf_info['name'],
+                           cluster_id=cluster_id,
+                           role=role,
+                           vim_id=vnf_info['vim_id'],
+                           vnf_id=vnf_info['id'],
+                           mgmt_url=vnf_info['mgmt_url'])
         LOG.debug(("_make_cluster_member_dict c : %s"), member_dict)
         return member_dict
 
@@ -277,35 +304,29 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
         for resource in vnf_resources:
             if resource['name'] == cp:
                 member_cp_id = resource['id']
-                break
-        return member_cp_id
+                return member_cp_id
+        return None
 
-    def _get_member_by_role(self, context, cluster_id, role, vim):
-        member_db = \
-            (self._model_query(context, VnfClusterMember).
-             filter(VnfClusterMember.cluster_id == cluster_id).
-             filter(VnfClusterMember.role == role).
-             filter(VnfClusterMember.placement_attr == vim).one())
-        return member_db
-
-    def _get_member_by_vnf_id(self, context, vnf_id):
-        member_db = \
-            (self._model_query(context, VnfClusterMember).
-             filter(VnfClusterMember.vnf_id == vnf_id).one())
-        return member_db
-
-    def get_members_by_attr(self, context, key=None, value=None):
-        member_list = self._get_members_db(context)
-        if key is not None and value is not None:
-            for mem in member_list:
-                if mem[key] != value:
-                    member_list.remove(mem)
-        return member_list
+    def get_member_by_attr(self, context, filters=None, fields=None):
+        members = self._get_members_db(context, filters=filters, fields=fields)
+        if members:
+            return members[0]
+        raise vnfcluster.ClusterMemberAttributeInvalid(mem_attr=filters)
 
     def update_member_role(self, context, vim_obj, lb_obj, member, new_role):
         member_id = member['id']
         cluster_id = member['cluster_id']
         cluster_dict = self.get_cluster(context, cluster_id)
+
+        vim_name = vim_obj['name']
+
+        # Update role_config in cluster
+        role_config = cluster_dict['role_config']
+        if role_config.get(new_role) is None:
+            role_config[new_role] = dict()
+            role_config[new_role][vim_name] = dict()
+        role_config[new_role][vim_name][member_id] = member['vnf_id']
+
         if new_role == constants.CLUSTER_ACTIVE:
             vnfm_plugin = manager.TackerManager.get_service_plugins()['VNFM']
             cp_id = \
@@ -321,6 +342,8 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
                                      member_id, 'lb_member_id', lb_member_id)
             # Update from STANDBY to ACTIVE
             self._update_member_attr(context, member_id, 'role', new_role)
+            del role_config[constants.CLUSTER_STANDBY][vim_name][member_id]
+
         elif new_role == constants.CLUSTER_STANDBY:
             lb_member_id = member['lb_member_id']
             self._vim_drivers.invoke(vim_obj['type'], 'pool_member_remove',
@@ -330,7 +353,12 @@ class VnfClusterPluginDb(vnfcluster.VnfClusterPluginBase,
                                      auth_attr=vim_obj['auth_cred'])
             # remove ACTIVE member from lb
             self._update_member_attr(context, member_id, 'lb_member_id', None)
-            self._update_member_attr(context, member_id, 'role', new_role)
+            del role_config[constants.CLUSTER_ACTIVE][vim_name][member_id]
+
+        # Update member database
+        self._update_member_attr(context, member_id, 'role', new_role)
+        self._update_cluster_attr(context, cluster_id,
+                                  'role_config', role_config)
 
     def _update_member_attr(self, context, member_id, field, attr):
         with context.session.begin(subtransactions=True):

@@ -23,7 +23,7 @@ Create Date: 2017-12-22 15:31:26.179064
 
 # revision identifiers, used by Alembic.
 revision = '9935da7e3bf9'
-down_revision = 'e9a1e47fb0b5'
+down_revision = '5d490546290c'
 
 from alembic import op
 import sqlalchemy as sa
@@ -35,10 +35,11 @@ def upgrade(active_plugins=None, options=None):
         'clusters',
         sa.Column('id', sa.String(length=36), nullable=False),
         sa.Column('tenant_id', sa.String(length=64), nullable=False),
-        sa.Column('name', sa.String(length=255), nullable=True),
+        sa.Column('name', sa.String(length=255), nullable=False),
         sa.Column('description', sa.String(length=255), nullable=True),
         sa.Column('status', sa.String(length=255), nullable=False),
         sa.Column('vnfd_id', sa.String(length=36), nullable=False),
+        sa.Column('vip_endpoint', Json, nullable=True),
         sa.Column('role_config', Json, nullable=True),
         sa.Column('lb_info', Json, nullable=True),
         sa.ForeignKeyConstraint(['vnfd_id'], ['vnfd.id'], ),
@@ -50,15 +51,16 @@ def upgrade(active_plugins=None, options=None):
         'clustermembers',
         sa.Column('id', sa.String(length=36), nullable=False),
         sa.Column('tenant_id', sa.String(length=64), nullable=False),
-        sa.Column('name', sa.String(length=255), nullable=True),
+        sa.Column('name', sa.String(length=255), nullable=False),
         sa.Column('cluster_id', sa.String(length=36), nullable=False),
         sa.Column('vnf_id', sa.String(length=36), nullable=False),
         sa.Column('role', sa.String(length=255), nullable=False),
         sa.Column('mgmt_url', sa.String(length=255), nullable=True),
         sa.Column('lb_member_id', sa.String(length=36), nullable=True),
-        sa.Column('placement_attr', sa.String(length=255), nullable=False),
+        sa.Column('vim_id', sa.String(length=255), nullable=False),
         sa.ForeignKeyConstraint(['vnf_id'], ['vnf.id'], ),
         sa.ForeignKeyConstraint(['cluster_id'], ['clusters.id'], ),
+        sa.ForeignKeyConstraint(['vim_id'], ['vims.id'], ),
         sa.PrimaryKeyConstraint('id'),
         mysql_engine='InnoDB'
     )
