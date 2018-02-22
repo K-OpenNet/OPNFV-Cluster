@@ -18,28 +18,27 @@ _CLUSTER_MEMBER = 'clustermember'
 
 
 class ListCluster(tackerV10.ListCommand):
-
     """List Clusters that belong to a given tenant."""
+
     resource = _CLUSTER
-    list_columns = ['id', 'name', 'description', 'status',
-                    'vnfd_id', 'role_config']
+    list_columns = ['id', 'name', 'vnfd_id', 'status', 'vip_endpoint']
 
 
 class ShowCluster(tackerV10.ShowCommand):
-
     """Show information of a given Cluster."""
+
     resource = _CLUSTER
 
 
 class DeleteCluster(tackerV10.DeleteCommand):
-
     """Delete a given Cluster."""
+
     resource = _CLUSTER
 
 
 class CreateCluster(tackerV10.CreateCommand):
-
     """Create a Cluster."""
+
     resource = _CLUSTER
 
     def add_known_arguments(self, parser):
@@ -49,10 +48,10 @@ class CreateCluster(tackerV10.CreateCommand):
         vnfd_group = parser.add_mutually_exclusive_group(required=True)
         vnfd_group.add_argument(
             '--vnfd-id',
-            help='Set a ID for the VNFD')
+            help='VNFD ID to use as template to create member VNF')
         vnfd_group.add_argument(
             '--vnfd-name',
-            help='Set a name for the VNFD')
+            help='VNFD name to use as template to create member VNF')
         parser.add_argument('--policy-file',
                             help='Specify policy file for cluster',
                             required=True)
@@ -82,8 +81,7 @@ class CreateCluster(tackerV10.CreateCommand):
 
 
 class AddClusterMember(tackerV10.CreateCommand):
-
-    """Add VNF to specific cluster."""
+    """Add a new Cluster Member to given Cluster."""
 
     resource = _CLUSTER_MEMBER
 
@@ -91,9 +89,13 @@ class AddClusterMember(tackerV10.CreateCommand):
         parser.add_argument(
             'name', metavar='NAME',
             help='Set a name for the VNF cluster member')
-        parser.add_argument('--cluster-id',
-                            help='Set an ID of VNF cluster',
-                            required=True)
+        cluster_group = parser.add_mutually_exclusive_group()
+        cluster_group.add_argument(
+            '--cluster-id',
+            help='VNFD ID to use as template to create member VNF')
+        cluster_group.add_argument(
+            '--cluster-name',
+            help='VNFD name to use as template to create member VNF')
         vnfd_group = parser.add_mutually_exclusive_group()
         vnfd_group.add_argument(
             '--vnfd-id',
@@ -105,33 +107,46 @@ class AddClusterMember(tackerV10.CreateCommand):
             '--role',
             help='Set a [Active/Standby] role to cluster member',
             required=True)
-        parser.add_argument(
-            '--placement-attr',
-            help='Set vim to deploy cluster member',
-            required=False)
+        vim_group = parser.add_mutually_exclusive_group()
+        vim_group.add_argument(
+            '--vim-id',
+            help='Set a VIM ID to deploy cluster member')
+        vim_group.add_argument(
+            '--vim-name',
+            help='Set a VIM name to deploy cluster member')
 
     def args2body(self, parsed_args):
         body = {self.resource: {}}
 
         tacker_client = self.get_client()
         tacker_client.format = parsed_args.request_format
-
+        if parsed_args.cluster_name:
+            _id = tackerV10.find_resourceid_by_name_or_id(tacker_client,
+                                                          'cluster',
+                                                          parsed_args.
+                                                          cluster_name)
+            parsed_args.cluster_id = _id
         if parsed_args.vnfd_name:
             _id = tackerV10.find_resourceid_by_name_or_id(tacker_client,
                                                           'vnfd',
                                                           parsed_args.
                                                           vnfd_name)
             parsed_args.vnfd_id = _id
-
+        parsed_args.role = parsed_args.role.upper()
+        if parsed_args.vim_name:
+            _id = tackerV10.find_resourceid_by_name_or_id(tacker_client,
+                                                          'vim',
+                                                          parsed_args.
+                                                          vim_name)
+            parsed_args.vim_id = _id
         tackerV10.update_dict(parsed_args, body[self.resource],
                               ['tenant_id', 'name', 'cluster_id', 'vnfd_id',
-                               'role', 'placement_attr'])
+                               'role', 'vim_id'])
         return body
 
 
 class ListClusterMember(tackerV10.ListCommand):
-
-    """List ClusterMembers that belong to a given tenant."""
+    """List Cluster Members that belong to a given tenant."""
 
     resource = _CLUSTER_MEMBER
 
@@ -161,19 +176,16 @@ class ListClusterMember(tackerV10.ListCommand):
         return body
 
     list_columns = ['id', 'name', 'cluster_id', 'role', 'vnf_id',
-                    'mgmt_url', 'placement_attr', 'lb_member_id']
+                    'vim_id', 'mgmt_url', 'lb_member_id']
 
 
 class DeleteClusterMember(tackerV10.DeleteCommand):
+    """Delete a given Cluster Member."""
 
-    """Delete a given VnfClusterMember."""
     resource = _CLUSTER_MEMBER
 
 
 class ShowClusterMember(tackerV10.ShowCommand):
-
-    """Show information of a given VnfClusterMember."""
+    """Show information of a given Cluster Member."""
 
     resource = _CLUSTER_MEMBER
-    list_columns = ['id', 'name', 'cluster_id', 'role', 'vnf_id',
-                    'mgmt_url', 'placement_attr', 'lb_member_id']
