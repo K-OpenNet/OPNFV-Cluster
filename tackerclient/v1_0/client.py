@@ -670,11 +670,7 @@ class Client(ClientBase):
 
     @APIParamsCall
     def create_cluster(self, body=None):
-        tem = self.post(self.clusters_path, body)
-        print ("--------------")
-        print(tem)
-        print ("--------------")
-        return tem
+        return self.post(self.clusters_path, body)
 
     @APIParamsCall
     def list_clusters(self, retrieve_all=True, **_params):
