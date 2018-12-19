@@ -16,7 +16,7 @@ Problem description
 
 In Telco environment, the reliability of network service (NS) is highly
 required. Beside auto-healing and auto-scaling solutions, traditional
-redundancy configuration methods, such as Active-Active or Active-Standby
+redundancy configuration methods, such as active-active or active-standby
 (form a high availability cluster) could be applied to VNFs to ensure the
 reliability of the NS. These high availability cluster configurations enable
 fast recovery of VNFs operation in case of failure. Operators will need a
