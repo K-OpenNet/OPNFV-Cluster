@@ -14,9 +14,7 @@
 #    under the License.
 
 import abc
-
 import six
-
 from tacker._i18n import _
 from tacker.api import extensions
 from tacker.api.v1 import attributes as attr
