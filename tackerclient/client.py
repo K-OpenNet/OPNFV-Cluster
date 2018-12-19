@@ -137,13 +137,13 @@ class HTTPClient(object):
         headers['User-Agent'] = self.USER_AGENT
 
         resp = requests.request(
-            method,
-            url,
-            data=body,
-            headers=headers,
-            verify=self.verify_cert,
-            timeout=self.timeout,
-            **kwargs)
+             method,
+             url,
+             data=body,
+             headers=headers,
+             verify=self.verify_cert,
+             timeout=self.timeout,
+             **kwargs)
 
         return resp, resp.text
 
