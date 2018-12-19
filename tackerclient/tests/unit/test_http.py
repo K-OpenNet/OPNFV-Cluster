@@ -29,7 +29,7 @@ headers = {'User-Agent': 'python-tackerclient'}
 
 
 class TestHTTPClient(testtools.TestCase):
-
+    # class test
     def setUp(self):
 
         super(TestHTTPClient, self).setUp()
