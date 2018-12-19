@@ -115,7 +115,6 @@ class VNF(model_base.BASE, models_v1.HasId, models_v1.HasTenant,
     Here the term, 'VM', is intentionally avoided because it can be
     VM or other container.
     """
-
     __tablename__ = 'vnf'
     vnfd_id = sa.Column(types.Uuid, sa.ForeignKey('vnfd.id'))
     vnfd = orm.relationship('VNFD')
