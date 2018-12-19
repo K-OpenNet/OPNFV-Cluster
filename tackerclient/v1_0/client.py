@@ -17,7 +17,6 @@
 
 import logging
 import time
-
 import requests
 import six.moves.urllib.parse as urlparse
 
