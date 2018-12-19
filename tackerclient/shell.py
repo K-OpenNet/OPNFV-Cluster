@@ -19,7 +19,6 @@ Command-line interface to the Tacker APIs
 """
 
 from __future__ import print_function
-
 import argparse
 import getpass
 import inspect
