@@ -17,6 +17,5 @@
 # status constants is achievable
 
 PAGINATION_INFINITE = 'infinite'
-
 SORT_DIRECTION_ASC = 'asc'
 SORT_DIRECTION_DESC = 'desc'
