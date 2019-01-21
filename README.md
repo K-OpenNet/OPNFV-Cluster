@@ -300,6 +300,13 @@ None
 Implementation
 ==============
 
+Technical Report and Poster
+===========================
+
+Technical Report : [K-ONE#37 Optimization models for placing high availability requests over cloud infra.pdf](https://github.com/K-OpenNet/OPNFV-High-Availability-/files/2778753/K-ONE.37.Optimization.models.for.placing.high.availability.requests.over.cloud.infra.pdf)
+
+Poster : [[숭실대학교]ONK 2018 Fall.pdf](https://github.com/K-OpenNet/OPNFV-High-Availability-/files/2778764/ONK.2018.Fall.pdf)
+
 Assignee(s)
 -----------
 
